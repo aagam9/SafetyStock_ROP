@@ -14,6 +14,22 @@ from safety_stock_agent import BASE_DIR, SafetyStockInputError, run_analysis
 
 APP_TITLE = "Safety Stock / ROP Drift Review"
 INPUT_FILES = ("item_master.csv", "demand_history.csv", "receipt_history.csv")
+CALCULATION_HELP = """
+**Calculation used**
+
+- Safety stock: `z × √(L × σd² + d̄² × σL²)`
+- Reorder point: `d̄ × L + safety stock`
+
+- `d̄` and `σd`: mean and standard deviation from the most recent 26 weekly
+  demand rows, converted to daily values by dividing by 7.
+- `L` and `σL`: mean and standard deviation of actual receipt lead times in
+  calendar days.
+- Service assumptions: Class A uses `z = 2.05` (about 98%), Class B uses
+  `z = 1.65` (about 95%), and Class C uses `z = 1.28` (about 90%). An unknown
+  class defaults to `z = 1.65`.
+- The service-level interpretation assumes an approximately normal demand
+  distribution and reasonably stable, independent demand and lead-time variation.
+"""
 ACTION_LABELS = (
     ("increase_ss", "Increase"),
     ("decrease_ss", "Decrease"),
@@ -228,7 +244,12 @@ else:
     st.caption("No key is required. Without one, the existing rule-based fallback runs automatically.")
 
 st.subheader("3. Run and download")
-run_clicked = st.button("Run analysis", type="primary")
+run_clicked = st.button(
+    "Run analysis",
+    type="primary",
+    help=CALCULATION_HELP,
+)
+st.caption("Hover over **Run analysis** to see the calculation and service-level assumptions.")
 
 if run_clicked:
     missing = [filename for filename in INPUT_FILES if source == "Upload my files" and not uploads[filename]]
