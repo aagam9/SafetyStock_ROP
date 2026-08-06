@@ -162,6 +162,10 @@ st.markdown(
 
 with st.expander("What this tool does", expanded=True):
     st.markdown(
+        "**Formula and service-level assumptions**",
+        help=CALCULATION_HELP,
+    )
+    st.markdown(
         """
 1. Loads the item master, weekly demand history, and actual receipt lead times.
 2. Recalculates safety stock and reorder point for every SKU using demand variability
@@ -244,12 +248,7 @@ else:
     st.caption("No key is required. Without one, the existing rule-based fallback runs automatically.")
 
 st.subheader("3. Run and download")
-run_clicked = st.button(
-    "Run analysis",
-    type="primary",
-    help=CALCULATION_HELP,
-)
-st.caption("Hover over **Run analysis** to see the calculation and service-level assumptions.")
+run_clicked = st.button("Run analysis", type="primary")
 
 if run_clicked:
     missing = [filename for filename in INPUT_FILES if source == "Upload my files" and not uploads[filename]]
