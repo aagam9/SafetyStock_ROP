@@ -1,0 +1,484 @@
+SAFETY STOCK / REORDER POINT DRIFT AGENT
+CALCULATION METHODOLOGY AND REVIEW NOTES
+============================================================
+
+Document purpose
+----------------
+This document describes how safety_stock_agent.py calculates recommended
+safety stock and reorder point, determines which SKUs require review, and
+assigns an action through Claude or the rule-based fallback.
+
+This is a description of the implementation as of August 7, 2026. It is for
+business review, model governance, audit support, and future maintenance. It
+does not replace planner approval or the organization's inventory policy.
+
+
+1. INPUT DATA
+-------------
+
+The analysis uses three CSV data sets.
+
+1. item_master.csv
+   One row per SKU. Calculation fields:
+   - sku
+   - description
+   - item_class
+   - assumed_lead_time_days
+   - current_safety_stock
+   - current_rop
+   - unit_cost
+
+2. demand_history.csv
+   Demand history by SKU. Calculation fields:
+   - sku
+   - demand_qty
+
+   The sample format also contains week. The calculation does not parse or
+   sort the week field. Rows must therefore already be arranged from oldest
+   to newest within each SKU. The final 26 demand rows for a SKU are treated
+   as its recent period.
+
+3. receipt_history.csv
+   Actual supplier receipt performance by SKU. Calculation fields:
+   - sku
+   - actual_lead_time_days
+
+   The sample format also contains po_number, but po_number is not used in a
+   calculation.
+
+Expected business data conditions:
+   - SKU identifiers match exactly across all three files.
+   - Demand quantities use a consistent planning unit for each SKU.
+   - Lead times are calendar days.
+   - Unit cost uses one consistent currency.
+   - Demand quantities are nonnegative and lead times are meaningful positive
+     values. The application validates that calculation fields are numeric,
+     but it does not enforce every business reasonableness rule.
+   - Every item-master SKU has sufficient demand and receipt history.
+
+
+2. SERVICE LEVEL AND Z-SCORE POLICY
+-----------------------------------
+
+The SKU's item class selects a Z-score:
+
+   Class A: z = 2.05, approximately 98% service
+   Class B: z = 1.65, approximately 95% service
+   Class C: z = 1.28, approximately 90% service
+
+If item_class is not A, B, or C, the implementation defaults to z = 1.65.
+Class matching is case-sensitive.
+
+These percentages are approximate one-sided cycle-service probabilities under
+a normal-distribution assumption. They are not fill-rate guarantees. A service
+policy change should be made by changing the approved Z-score mapping, not by
+manually adjusting the formula output after calculation.
+
+
+3. DEMAND STATISTICS
+--------------------
+
+For each SKU, all demand_qty values are read in their existing CSV row order.
+
+3.1 Full-history demand statistics
+
+   full_mean = arithmetic mean of all weekly demand rows
+
+   full_std = sample standard deviation of all weekly demand rows
+              (ddof = 1)
+
+If only one demand row exists, full_std is set to zero.
+
+3.2 Outlier detection
+
+For every weekly demand value:
+
+   demand_z_score = (weekly_demand - full_mean) / full_std
+
+A demand row is classified as an outlier when:
+
+   absolute value of demand_z_score > 3.0
+
+If full_std is zero, no demand row is classified as an outlier.
+
+Important implementation note:
+The code creates an outlier-adjusted comparison array, replacing detected
+outliers with the full-history mean. However, that adjusted array is not used
+in the current safety-stock or reorder-point calculation. Outliers remain in
+the recent demand mean and standard deviation. Their presence separately
+causes the SKU to be flagged for review.
+
+3.3 Recent demand window
+
+   recent demand = final 26 demand rows for the SKU
+
+If fewer than 26 rows exist, all available demand rows are used.
+
+   recent_weekly_mean = arithmetic mean of recent demand
+
+   recent_weekly_std = sample standard deviation of recent demand
+                       (ddof = 1)
+
+If only one recent row exists, recent_weekly_std is set to zero.
+
+3.4 Older-period comparison and trend
+
+When more than 26 demand rows exist:
+
+   older demand = all rows before the final 26 rows
+   older_mean = arithmetic mean of older demand
+
+When 26 or fewer rows exist, the full available demand history is also used
+as the older comparison period. In that situation, recent and older averages
+will normally be the same.
+
+When older_mean is greater than zero:
+
+   trend_pct = (recent_weekly_mean - older_mean) / older_mean
+
+When older_mean is zero, trend_pct is set to zero.
+
+The SKU is considered trending when:
+
+   absolute value of trend_pct > 25%
+
+The threshold is strictly greater than 25%; exactly 25% is not flagged.
+
+3.5 Intermittent demand
+
+   zero_demand_share = number of zero-demand rows / all demand rows
+
+The SKU is considered intermittent when:
+
+   zero_demand_share > 30%
+
+The threshold is strictly greater than 30%; exactly 30% is not flagged.
+
+
+4. LEAD-TIME STATISTICS
+-----------------------
+
+All actual_lead_time_days receipt rows for the SKU are used.
+
+   actual_lt_mean = arithmetic mean of actual lead-time days
+
+   actual_lt_std = sample standard deviation of actual lead-time days
+                   (ddof = 1)
+
+If only one receipt row exists, actual_lt_std is set to zero.
+
+Lead-time drift compares actual average performance with the planning master:
+
+   lt_drift_pct =
+       (actual_lt_mean - assumed_lead_time_days)
+       / assumed_lead_time_days
+
+If assumed_lead_time_days is zero, lt_drift_pct is set to zero.
+
+The SKU has material lead-time drift when:
+
+   absolute value of lt_drift_pct > 20%
+
+The threshold is strictly greater than 20%; exactly 20% is not flagged.
+
+
+5. CONVERSION FROM WEEKLY TO DAILY DEMAND
+-----------------------------------------
+
+The formula operates in calendar days. Weekly demand statistics are converted
+as follows:
+
+   daily_demand_mean = recent_weekly_mean / 7
+
+   daily_demand_std = recent_weekly_std / 7
+
+Actual lead times are already measured in days and are not converted.
+
+This implementation assumes a seven-day week and scales both the weekly mean
+and weekly standard deviation linearly by seven.
+
+
+6. RECOMMENDED SAFETY STOCK
+---------------------------
+
+Variable definitions:
+
+   z          = Z-score selected from item_class
+   L_mean     = actual_lt_mean, in days
+   L_std      = actual_lt_std, in days
+   D_mean     = daily_demand_mean
+   D_std      = daily_demand_std
+
+The combined demand and lead-time variance term is:
+
+   variance_term = L_mean * (D_std ^ 2)
+                   + (D_mean ^ 2) * (L_std ^ 2)
+
+Recommended safety stock is:
+
+   recommended_safety_stock =
+       z * sqrt(max(variance_term, 0))
+
+The max operation prevents a negative value from being passed to the square
+root. The reported safety-stock recommendation is rounded to the nearest whole
+unit.
+
+Interpretation of the two variance components:
+
+   L_mean * (D_std ^ 2)
+       Inventory protection for demand variability during average lead time.
+
+   (D_mean ^ 2) * (L_std ^ 2)
+       Inventory protection for supplier lead-time variability at average
+       daily demand.
+
+
+7. RECOMMENDED REORDER POINT
+----------------------------
+
+Expected demand during average actual lead time is:
+
+   lead_time_demand = D_mean * L_mean
+
+Recommended reorder point is:
+
+   recommended_rop = lead_time_demand + recommended_safety_stock
+
+The reported reorder-point recommendation is rounded to the nearest whole
+unit.
+
+The current_rop field is displayed for comparison and supplied to Claude as
+context. The current implementation does not calculate a separate ROP drift
+percentage and does not flag a SKU solely because current ROP differs from
+recommended ROP.
+
+
+8. SAFETY-STOCK DRIFT
+---------------------
+
+When current_safety_stock is greater than zero:
+
+   ss_drift_pct =
+       (recommended_safety_stock - current_safety_stock)
+       / current_safety_stock
+
+The unrounded recommended safety stock is used in this calculation.
+
+Interpretation:
+   - Positive drift means the recommendation is above the current setting.
+   - Negative drift means the recommendation is below the current setting.
+
+If current_safety_stock is zero or negative, ss_drift_pct is set to 100%.
+
+Safety-stock drift is material when:
+
+   absolute value of ss_drift_pct > 25%
+
+The threshold is strictly greater than 25%; exactly 25% is not flagged.
+
+
+9. FLAGGING FUNNEL
+------------------
+
+A SKU is flagged for review when any one or more of these conditions is true:
+
+   1. Absolute safety-stock drift is greater than 25%.
+   2. Absolute lead-time drift is greater than 20%.
+   3. Absolute recent demand trend is greater than 25%.
+   4. More than 30% of full-history demand rows are zero.
+   5. At least one full-history weekly demand outlier has an absolute
+      Z-score greater than 3.0.
+
+SKUs with none of these conditions are auto-cleared. Auto-cleared means the
+current parameters did not trigger the review policy; it does not guarantee
+that the item will achieve a particular fill rate.
+
+
+10. DOLLAR IMPACT
+-----------------
+
+For every SKU:
+
+   dollar_impact =
+       absolute value of
+       (unrounded recommended_safety_stock - current_safety_stock)
+       * unit_cost
+
+Dollar impact is rounded to two decimal places. It is an estimate of the value
+of the safety-stock quantity difference. It is not a forecast of savings,
+stockout cost, revenue loss, or total working-capital change.
+
+The run-level "estimated dollars at stake" is the sum of dollar_impact for
+flagged SKUs in the review queue.
+
+
+11. REASONING FOR FLAGGED SKUS
+------------------------------
+
+Only flagged SKUs are escalated for an action decision. The statistical safety
+stock and reorder point are already calculated before this reasoning step.
+Neither Claude nor the fallback changes those calculated recommendations.
+
+Available actions:
+   - increase_ss
+   - decrease_ss
+   - hold_no_change
+   - manual_review_needed
+
+11.1 Claude reasoning mode
+
+When an Anthropic API key is available, Claude receives the SKU's current and
+recommended parameters plus the calculated demand, trend, intermittency,
+outlier, and lead-time signals. It returns:
+
+   - action
+   - confidence: high, medium, or low
+   - risk_if_ignored
+   - a short plain-language rationale
+
+Claude is instructed to use manual_review_needed only when the data is too
+ambiguous or thin to trust either the current or recommended number.
+
+If the Claude call fails, the application retries up to three total attempts.
+After the final failure, that SKU automatically uses the rule-based fallback.
+
+11.2 Rule-based fallback
+
+When no API key is available, or Claude fails after its retries, the following
+rules are applied in this order:
+
+Rule 1 - Manual review
+   If an outlier exists AND absolute safety-stock drift is greater than 50%:
+   - action = manual_review_needed
+   - confidence = low
+   - reason = a large recommendation may be distorted by an outlier order
+
+Rule 2 - Increase safety stock
+   Otherwise, if safety-stock drift is greater than +25%:
+   - action = increase_ss
+   - confidence = medium
+   - risk = stockout risk
+
+Rule 3 - Decrease safety stock
+   Otherwise, if safety-stock drift is less than -25%:
+   - action = decrease_ss
+   - confidence = medium
+   - risk = tying up cash in excess stock
+
+Rule 4 - Hold
+   Otherwise:
+   - action = hold_no_change
+   - confidence = medium
+   - reason = another signal caused the flag, but safety-stock drift is modest
+
+The fallback primarily uses safety-stock drift. Except for the outlier guard
+in Rule 1, it does not reinterpret trends, intermittency, or lead-time drift.
+
+
+12. REVIEW-QUEUE PRIORITIZATION
+-------------------------------
+
+The flagged review queue is sorted as follows:
+
+   1. Rows with manual_review_needed OR low confidence are placed first.
+   2. Within the urgent and nonurgent groups, rows are ordered by descending
+      dollar impact.
+
+This means a low-dollar, low-confidence item can appear before a larger-dollar
+item because it requires human attention.
+
+
+13. EXCEL OUTPUT
+----------------
+
+The output workbook is safety_stock_review.xlsx.
+
+Review Queue tab:
+   Contains flagged SKUs, current and recommended settings, drift measures,
+   dollar impact, action, confidence, risk, and rationale.
+
+Portfolio Scan tab:
+   Contains every scanned SKU and its main statistical recommendation and
+   flagging signals.
+
+
+14. KEY MODEL ASSUMPTIONS AND LIMITATIONS
+-----------------------------------------
+
+1. Continuous-review interpretation
+   The reorder-point formula assumes replenishment is triggered when inventory
+   position reaches the ROP. It does not include a periodic review interval.
+
+2. Normal-distribution service interpretation
+   The class Z-scores assume the combined uncertainty can be represented well
+   enough by a normal approximation. Highly skewed or intermittent demand may
+   not achieve the stated approximate service probability.
+
+3. Independence
+   The combined variance formula assumes demand variability and lead-time
+   variability are reasonably independent. It does not include a covariance
+   term.
+
+4. Historical representativeness
+   The recent 26 demand rows and all available receipt lead times are assumed
+   to be representative of upcoming operations.
+
+5. Row order
+   The application does not sort demand by the week column. Correct oldest-to-
+   newest CSV ordering is essential.
+
+6. Seven-day scaling
+   Weekly demand mean and standard deviation are both divided by seven. This
+   is the explicit conversion used by the current implementation.
+
+7. Outliers
+   Outliers are detected and trigger review, but they remain in the statistics
+   used by the formula.
+
+8. Intermittent demand
+   Intermittency triggers review, but the safety-stock formula itself remains
+   the same normal-approximation formula. A specialized intermittent-demand
+   method is not applied.
+
+9. Seasonality
+   Seasonality is not explicitly calculated. The trend comparison only checks
+   the recent average against the older average.
+
+10. Forecasting and operating constraints
+    The model does not explicitly include forecast error, promotions, planned
+    shutdowns, minimum order quantities, order multiples, shelf life, capacity,
+    supplier commitments, backorder policy, or inventory-position accuracy.
+
+11. Service metric
+    The approximate 98% / 95% / 90% targets are cycle-service assumptions,
+    not item fill rates or order fill rates.
+
+12. Advisory output
+    Recommendations should be reviewed by a material planner before ERP master
+    data is changed. Manual review is especially important for thin history,
+    data-quality issues, outliers, structural demand changes, and constrained
+    supply situations.
+
+
+15. GOVERNANCE CHECKLIST FOR FUTURE REVIEW
+------------------------------------------
+
+When reviewing or changing this methodology, confirm:
+
+   - Are A/B/C service targets still approved by the business?
+   - Is 26 rows still the correct recent-demand window?
+   - Are 25% safety-stock drift and 20% lead-time drift appropriate?
+   - Should demand history be sorted explicitly by the week field?
+   - Should outliers be excluded, capped, or retained in the formula?
+   - Should weekly standard deviation use a different daily conversion?
+   - Is the normal approximation suitable for intermittent or low-volume SKUs?
+   - Should seasonality or forecast error be modeled explicitly?
+   - Should current ROP drift become its own flagging condition?
+   - Should receipt history use a recent window instead of all available rows?
+   - Are unit cost and dollar-impact definitions appropriate for prioritization?
+   - Are Claude prompts, retry behavior, and fallback rules still approved?
+   - Have changes been tested against historical stockouts, service, and
+     inventory outcomes before production use?
+
+
+END OF DOCUMENT
