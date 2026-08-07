@@ -257,9 +257,11 @@ if run_clicked:
     else:
         st.session_state.pop("last_report", None)
         st.session_state.pop("last_summary", None)
-        status = st.status("Analysis running…", expanded=True)
-        progress_bar = st.progress(0, text="Preparing input files")
-        log_placeholder = st.empty()
+        transient_output = st.empty()
+        with transient_output.container():
+            status = st.status("Analysis running…", expanded=True)
+            progress_bar = st.progress(0, text="Preparing input files")
+            log_placeholder = st.empty()
         report_progress = _progress_callback(log_placeholder, progress_bar)
 
         try:
@@ -272,8 +274,7 @@ if run_clicked:
                     progress_callback=report_progress,
                 )
                 _save_run_result(result)
-            status.update(label="Analysis complete", state="complete", expanded=False)
-            st.success("The Excel review is ready to download.")
+            transient_output.empty()
         except SafetyStockInputError as exc:
             status.update(label="Input files need attention", state="error", expanded=True)
             st.error(str(exc))
