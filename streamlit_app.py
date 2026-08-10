@@ -171,8 +171,8 @@ with st.expander("What this tool does", expanded=True):
 2. Recalculates safety stock and reorder point for every SKU using demand variability
    and actual supplier lead-time variability.
 3. Flags material drift, trend, intermittency, lead-time drift, and demand outliers.
-4. Reviews only flagged SKUs with Claude when an API key is available; otherwise it
-   automatically uses the existing transparent rule-based fallback.
+4. Reviews only flagged SKUs with Claude when an administrator API key is configured;
+   otherwise it automatically uses the existing transparent rule-based fallback.
 5. Produces `safety_stock_review.xlsx` with a prioritized **Review Queue** and a full
    **Portfolio Scan**.
 
@@ -231,23 +231,8 @@ if source == "Upload my files":
 else:
     st.info("The bundled 60-SKU sample data will be used. Your local sample files are not modified.")
 
-st.subheader("2. Choose the reasoning mode")
 deployed_key = _deployment_api_key()
-session_key = st.text_input(
-    "Anthropic API key (optional)",
-    type="password",
-    help=(
-        "Used in memory for this browser session only. It is never written to a file "
-        "or included in the progress log. Leave blank to use the administrator key, "
-        "if configured, or the rule-based fallback."
-    ),
-)
-if deployed_key:
-    st.caption("An administrator API key is configured. A session key entered above takes priority.")
-else:
-    st.caption("No key is required. Without one, the existing rule-based fallback runs automatically.")
-
-st.subheader("3. Run and download")
+st.subheader("2. Run and download")
 run_clicked = st.button("Run analysis", type="primary")
 
 if run_clicked:
@@ -270,7 +255,7 @@ if run_clicked:
                 _stage_inputs(run_dir, source, uploads)
                 result = run_analysis(
                     data_dir=run_dir,
-                    api_key=session_key or deployed_key,
+                    api_key=deployed_key,
                     progress_callback=report_progress,
                 )
                 _save_run_result(result)

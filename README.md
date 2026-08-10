@@ -32,6 +32,8 @@ where that gap has become real, and tells you *why*, not just *that*.
 - `safety_stock_agent.py` - the agent itself. Reads the CSVs, runs the
   analysis, calls Claude for flagged SKUs, writes the Excel output.
 - `streamlit_app.py` - the business-user web interface.
+- `CALCULATION_METHODOLOGY.txt` - calculation formulas, thresholds,
+  assumptions, fallback rules, limitations, and governance review checklist.
 - `requirements.txt` and `.streamlit/config.toml` - deployment dependencies
   and presentation settings.
 - `item_master.csv`, `demand_history.csv`, `receipt_history.csv` - sample data
@@ -46,13 +48,12 @@ python -m streamlit run streamlit_app.py
 ```
 
 Streamlit prints a local URL, normally `http://localhost:8501`. Open it in a
-browser, upload the three CSVs (or choose the bundled sample data), optionally
-enter an Anthropic API key, and select **Run analysis**. The completed Excel
-workbook is downloaded from the page.
+browser, upload the three CSVs (or choose the bundled sample data), and select
+**Run analysis**. The completed Excel workbook is downloaded from the page.
 
 Uploads are staged in a separate temporary directory for each run and removed
-after the workbook is captured. A key entered into the password field is kept
-in the Streamlit browser session only; it is not logged or written to disk.
+after the workbook is captured. API keys are not entered through the planner
+interface, logged, or written to the report.
 
 ## Keep using the command line
 
@@ -116,8 +117,8 @@ The project is laid out for Streamlit Community Cloud:
 
 If an administrator key is configured, all users can invoke Claude against
 that account. Restrict app access and monitor usage/costs accordingly. If no
-shared key is configured, users can paste their own key for the session or use
-the rule-based fallback.
+shared key is configured, the web app automatically uses the rule-based
+fallback.
 
 Actual cloud publication requires access to the target GitHub repository and
 Streamlit workspace. The code and dependency/configuration files in this
