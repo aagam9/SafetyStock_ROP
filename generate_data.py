@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generates synthetic ERP-style exports for the Safety Stock / ROP Drift agent:
-  - item_master.csv     : SKU, class, current safety stock/ROP, assumed lead time, cost
+  - item_master.csv     : SKU, supplier, class, current safety stock/ROP, assumed lead time, cost
   - demand_history.csv  : 104 weeks of actual weekly demand per SKU
   - receipt_history.csv : actual PO receipt lead times per SKU (last ~15-25 POs)
 
@@ -84,6 +84,8 @@ def main():
 
     categories = ["Fastener", "Bearing", "Gasket", "Circuit Board", "Motor",
                   "Sensor", "Casting", "Valve", "Wiring Harness", "Bracket"]
+    suppliers = ["Apex Components", "BlueRiver Industrial", "Cobalt Supply",
+                 "Delta Manufacturing", "Evergreen Parts", "Frontier Materials"]
 
     for i in range(1, n_sku + 1):
         sku = f"MAT-{1000 + i}"
@@ -128,6 +130,9 @@ def main():
         item_rows.append({
             "sku": sku,
             "description": f"{RNG.choice(categories)} - {sku}",
+            # One primary supplier per SKU for this version. The deterministic
+            # assignment keeps the sample repeatable without changing demand RNG.
+            "supplier": suppliers[(i - 1) % len(suppliers)],
             "item_class": item_class,
             "assumed_lead_time_days": assumed_lt_days,
             "current_safety_stock": int(current_ss),

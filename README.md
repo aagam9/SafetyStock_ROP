@@ -1,151 +1,195 @@
-# Safety Stock / ROP Drift Agent
+# Safety Stock / ROP Drift Review
 
-Detects safety stock and reorder point parameters that have drifted from what
-they statistically should be — then uses Claude to make the judgment call on
-ambiguous cases (trends, seasonality, outliers, thin data) that pure math
-can't resolve on its own.
+A Streamlit inventory-planning application that recalculates Safety Stock and
+Reorder Point (ROP), produces an Excel review queue, and enables grounded
+questions about the completed analysis through NVIDIA Nemotron.
 
-## Why this exists
-Safety stock/ROP is usually set once, from whatever demand and lead-time
-assumptions existed at the time, and then never revisited — until a stockout
-or an inventory audit forces the issue. This agent proactively finds the SKUs
-where that gap has become real, and tells you *why*, not just *that*.
+The existing calculation engine remains authoritative. Python performs all
+filtering, joins, aggregation, forecasting, gap ranking, and Stockout Risk
+scoring. Nemotron receives a small question-specific evidence packet and
+explains the results; it is not used as a database or calculation engine.
 
-## How it works
-1. **Statistics do the screening.** For every SKU, it recalculates safety
-   stock/ROP using actual recent demand variability and actual supplier lead
-   time performance (the combined demand + lead-time variance formula), and
-   compares it to what's currently set.
-2. **Only real drift gets escalated.** SKUs where the numbers still hold up
-   are auto-cleared — no need to review them.
-3. **The agent makes the judgment call.** For flagged SKUs, Claude reviews the
-   drift alongside trend/seasonality/outlier signals and decides: increase,
-   decrease, hold, or flag for manual review (e.g. because an outlier order is
-   probably distorting the recommendation) — with a plain-language rationale.
-4. **Output:** `safety_stock_review.xlsx` — a prioritized Review Queue tab
-   (ranked by $ impact, with anything needing manual review pushed to the top
-   regardless of size) and a Portfolio Scan tab covering every SKU.
-
-## Files
-- `generate_data.py` — creates the synthetic sample data (item master, 2
-  years of weekly demand, PO receipt history). Run once to get started.
-- `safety_stock_agent.py` - the agent itself. Reads the CSVs, runs the
-  analysis, calls Claude for flagged SKUs, writes the Excel output.
-- `streamlit_app.py` - the business-user web interface.
-- `CALCULATION_METHODOLOGY.txt` - calculation formulas, thresholds,
-  assumptions, fallback rules, limitations, and governance review checklist.
-- `requirements.txt` and `.streamlit/config.toml` - deployment dependencies
-  and presentation settings.
-- `item_master.csv`, `demand_history.csv`, `receipt_history.csv` - sample data
-  already generated for you (60 SKUs).
-- `safety_stock_review.xlsx` - sample output from a run.
-
-## Run the web app locally
+## Run locally
 
 ```bash
 python -m pip install -r requirements.txt
-python -m streamlit run streamlit_app.py
+streamlit run streamlit_app.py
 ```
 
-Streamlit prints a local URL, normally `http://localhost:8501`. Open it in a
-browser, upload the three CSVs (or choose the bundled sample data), and select
-**Run analysis**. The completed Excel workbook is downloaded from the page.
-
-Uploads are staged in a separate temporary directory for each run and removed
-after the workbook is captured. API keys are not entered through the planner
-interface, logged, or written to the report.
-
-## Keep using the command line
-
-The original command remains available:
+The command-line analysis remains available:
 
 ```bash
 python safety_stock_agent.py
 ```
 
-It reads the three CSVs beside the script and writes
-`safety_stock_review.xlsx` there, just as before. To regenerate the bundled
-sample data, run:
+The web workflow is:
+
+1. Upload the three CSV files or choose the bundled sample data.
+2. Select **Run analysis**.
+3. Review the run summary and download `safety_stock_review.xlsx`.
+4. If NVIDIA is configured, use **Ask Your Inventory Data** for grounded
+   questions and follow-ups.
+
+New uploads or a newly run analysis clear the prior assistant conversation so
+results from different data sets cannot be mixed.
+
+## Input files
+
+CSV headers are case-sensitive. Keep SKU identifiers consistent, including
+capitalization and leading zeros.
+
+### `item_master.csv`
+
+One row per SKU.
+
+| Column | Meaning |
+| --- | --- |
+| `sku` | Nonblank unique SKU identifier |
+| `description` | Item description |
+| `supplier` | Primary/current supplier for this SKU |
+| `item_class` | ABC class (`A`, `B`, or `C`) |
+| `assumed_lead_time_days` | Current planning lead time in calendar days |
+| `current_safety_stock` | Current Safety Stock setting |
+| `current_rop` | Current ROP setting |
+| `unit_cost` | Unit cost in one consistent currency |
+
+This version assumes one primary supplier per SKU. It does not implement
+multi-sourcing.
+
+### `demand_history.csv`
+
+One row per SKU/week.
+
+| Column | Meaning |
+| --- | --- |
+| `sku` | Item identifier present in `item_master.csv` |
+| `week` | Week number or valid date; unique within the SKU |
+| `demand_qty` | Nonnegative demand quantity |
+
+Keep rows in oldest-to-newest order within each SKU. The calculation engine
+uses the most recent 26 rows as its recent-demand window.
+
+### `receipt_history.csv`
+
+One row per received purchase order.
+
+| Column | Meaning |
+| --- | --- |
+| `sku` | Item identifier present in `item_master.csv` |
+| `po_number` | Nonblank unique receipt/PO identifier |
+| `actual_lead_time_days` | Positive actual receipt lead time in calendar days |
+
+Supplier is joined from `item_master.csv`; it is not required in receipt
+history for this single-sourcing version.
+
+Validation rejects missing columns, blank SKU/supplier values, duplicate item
+SKUs, duplicate SKU/week rows, duplicate PO numbers, invalid numeric values,
+malformed week values, negative demand, nonpositive lead time, unknown SKUs,
+and item-master SKUs without demand or receipt history.
+
+## Existing Safety Stock and ROP analysis
+
+For each SKU, the engine calculates recent weekly demand mean and variability,
+demand trend, intermittency, demand outliers, actual lead-time mean and
+variability, recommended Safety Stock, and recommended ROP. ABC classes select
+the existing service-level Z-scores. The formulas and thresholds are documented
+in `CALCULATION_METHODOLOGY.txt`.
+
+Only flagged SKUs enter the review queue. The legacy review step can optionally
+use Claude through `ANTHROPIC_API_KEY`; without that key, the existing
+transparent rule-based review still runs. This is separate from the new
+Nemotron conversational assistant.
+
+The workbook contains:
+
+- **Review Queue**: flagged SKUs, supplier, current/recommended settings,
+  drift, dollar impact, action, confidence, risk, and rationale.
+- **Portfolio Scan**: every SKU with supplier, demand/lead-time statistics,
+  current/recommended Safety Stock and ROP, and review flags.
+
+## NVIDIA Nemotron setup
+
+The assistant calls NVIDIA's OpenAI-compatible hosted endpoint with the
+`openai` Python client. No credential is stored in source or generated reports.
+
+Required:
+
+```text
+NVIDIA_API_KEY=your_api_key_here
+```
+
+Optional overrides:
+
+```text
+NVIDIA_MODEL=nvidia/nemotron-3-super-120b-a12b
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+```
+
+The model and endpoint are centralized in `inventory_assistant.py`. Set the
+variables in the environment before starting Streamlit. `.env.example` is a
+non-secret template; the application does not automatically load `.env` files.
+
+For Streamlit deployment, the equivalent `.streamlit/secrets.toml` is:
+
+```toml
+NVIDIA_API_KEY = "your-key-here"
+NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+```
+
+Obtain an API key from the NVIDIA API catalog/account used by your
+organization. Do not commit `.env`, `settings.json`, or
+`.streamlit/secrets.toml`; these paths are ignored by Git.
+
+If `NVIDIA_API_KEY` is absent or the hosted service fails, the inventory
+analysis and Excel report continue to work. Only the assistant is unavailable.
+
+## Assistant capabilities
+
+The grounded assistant supports:
+
+- SKU demand behavior, trends, variability, and intermittency
+- deterministic weekly demand forecasts for a named SKU
+- current versus recommended Safety Stock and ROP
+- Safety Stock and ROP gap rankings
+- an explainable relative **Stockout Risk** ranking
+- receipt lead-time averages and variability
+- unusually long/inconsistent receipt behavior
+- supplier lead-time performance and consistency
+- supplier and SKU comparisons
+- bounded conversational follow-ups
+
+Forecasts use up to the latest 13 observations, fit a simple linear trend, and
+damp that trend by 50%. They are transparent planning estimates rather than
+promises of future demand.
+
+Stockout Risk is a relative 0-100 planning score based on Safety Stock gap, ROP
+gap, demand variability, lead-time variability, positive trend, and ABC
+criticality. It is not a probability of stockout.
+
+## Data and analytical limitations
+
+- The inputs do not contain inventory-position history, backorders, or explicit
+  stockout events. The app cannot report historical stockout counts.
+- Supplier analysis is currently lead-time performance and consistency, not a
+  complete supplier scorecard.
+- OTIF, fill rate, quality, and promised-date adherence require fields that are
+  not present in the current schemas.
+- Forecasts are estimates based only on uploaded demand history; they do not
+  include promotions, pricing, capacity, or external drivers.
+- Nemotron explains deterministic evidence. It does not replace the Safety
+  Stock/ROP engine or independently calculate portfolio metrics.
+- Planner approval is required before changing ERP planning parameters.
+
+## Tests
+
+The test suite uses no real NVIDIA calls and requires no API key:
 
 ```bash
-python generate_data.py
+python -m unittest discover -s tests -v
 ```
 
-## File naming and structure
-
-Use these exact data sets. The web app has one clearly labeled upload slot for
-each file and stages it under the correct name.
-
-| Filename | One row per | Columns |
-| --- | --- | --- |
-| `item_master.csv` | SKU | `sku`, `description`, `item_class`, `assumed_lead_time_days`, `current_safety_stock`, `current_rop`, `unit_cost` |
-| `demand_history.csv` | SKU/week | `sku`, `week`, `demand_qty` |
-| `receipt_history.csv` | Received PO | `sku`, `po_number`, `actual_lead_time_days` |
-
-Business data rules:
-
-- Include a header row and keep SKU values consistent across all files,
-  including capitalization and leading zeros.
-- Use one item-master row per SKU, one demand row per SKU/week, and one receipt
-  row per received PO.
-- Sort each SKU's demand rows from oldest to newest. The last 26 rows are used
-  as the recent demand window.
-- Keep numeric columns numeric: do not include currency signs, percent signs,
-  or thousands separators.
-- Use `A`, `B`, or `C` for `item_class`; calendar days for lead time; the same
-  planning unit for demand and inventory; and one consistent unit-cost currency.
-
-The three CSVs already in this folder are working samples. They can also be
-downloaded directly from the web app.
-
-## Deploy on Streamlit Community Cloud
-
-The project is laid out for Streamlit Community Cloud:
-
-1. Put this folder in a GitHub repository. Do not commit `settings.json` or
-   `.streamlit/secrets.toml`; both are excluded by `.gitignore`.
-2. Sign in at `share.streamlit.io`, choose **Create app**, and select the
-   repository, branch, and `streamlit_app.py` as the entry point.
-3. In **Advanced settings**, select Python 3.12.
-4. Optional: add a shared administrator key in the Secrets field:
-
-   ```toml
-   ANTHROPIC_API_KEY = "your-key-here"
-   ```
-
-5. Deploy and share the generated `streamlit.app` URL with planners.
-
-If an administrator key is configured, all users can invoke Claude against
-that account. Restrict app access and monitor usage/costs accordingly. If no
-shared key is configured, the web app automatically uses the rule-based
-fallback.
-
-Actual cloud publication requires access to the target GitHub repository and
-Streamlit workspace. The code and dependency/configuration files in this
-folder are ready for that final account-linked step.
-
-## API key options
-
-For the CLI, either set an environment variable:
-```bash
-export ANTHROPIC_API_KEY="your_key_here"
-```
-or create a `settings.json` next to the script:
-```json
-{"ANTHROPIC_API_KEY": "your_key_here"}
-```
-Without a key, it runs with a transparent rule-based fallback so the pipeline
-still works end-to-end — you just lose the nuanced judgment on ambiguous
-cases (that's the whole point of the agent, so add the key when you can).
-
-Most ERPs (SAP MD04/MC.9, Oracle, etc.) can export exactly this via standard
-reports - material master, historical consumption, and PO history with actual
-vs. planned dates.
-
-## Tuning
-In `safety_stock_agent.py`:
-- `DRIFT_THRESHOLD_PCT` — how much statistical drift before a SKU is flagged
-- `LT_DRIFT_THRESHOLD` — how much lead-time drift before flagging
-- `CLASS_Z` — service-level Z-scores per item class (A/B/C)
-- `RECENT_WINDOW_WEEKS` — how far back "recent" demand looks for trend
-  comparison
+Coverage includes supplier validation/joining, SKU retrieval, supplier
+aggregation, deterministic forecasts, Safety Stock/ROP rankings, Stockout Risk,
+unsupported-data responses, context construction, session reset, missing NVIDIA
+configuration, and a mocked Nemotron call.

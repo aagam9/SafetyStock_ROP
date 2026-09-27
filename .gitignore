@@ -3,4 +3,5 @@ __pycache__/
 .venv/
 venv/
 settings.json
+.env
 .streamlit/secrets.toml

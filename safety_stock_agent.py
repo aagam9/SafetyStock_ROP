@@ -113,6 +113,18 @@ def analyze_sku(item: dict, demand: pd.Series, lead_times: pd.Series) -> dict:
         or has_outliers
     )
 
+    analysis_flags = []
+    if abs(ss_drift_pct) > DRIFT_THRESHOLD_PCT:
+        analysis_flags.append("material safety-stock gap")
+    if abs(lt_drift_pct) > LT_DRIFT_THRESHOLD:
+        analysis_flags.append("lead-time drift")
+    if is_trending:
+        analysis_flags.append("demand trend")
+    if is_intermittent:
+        analysis_flags.append("intermittent demand")
+    if has_outliers:
+        analysis_flags.append("demand outlier")
+
     return {
         **item,
         "recent_weekly_mean": round(recent_mean, 1),
@@ -122,12 +134,17 @@ def analyze_sku(item: dict, demand: pd.Series, lead_times: pd.Series) -> dict:
         "zero_demand_share": round(zero_share * 100, 1),
         "is_intermittent": is_intermittent,
         "has_outliers": has_outliers,
+        "service_level_z": z,
         "lt_actual_mean_days": round(lt_actual_mean, 1),
+        "lt_actual_std_days": round(lt_actual_std, 1),
         "lt_drift_pct": round(lt_drift_pct * 100, 1),
         "recommended_safety_stock": round(recommended_ss),
         "recommended_rop": round(recommended_rop),
         "ss_drift_pct": round(ss_drift_pct * 100, 1),
         "flagged": flagged,
+        "analysis_flags": analysis_flags,
+        "demand_observations": int(len(demand)),
+        "receipt_observations": int(len(lead_times)),
         "dollar_impact": round(abs(recommended_ss - current_ss) * item["unit_cost"], 2),
     }
 
@@ -244,38 +261,41 @@ def write_excel(review_queue: list[dict], all_results: list[dict],
     # Sheet 1 — Review Queue (flagged SKUs, agent-reasoned)
     ws1 = wb.active
     ws1.title = "Review Queue"
-    cols1 = ["sku", "description", "item_class", "current_safety_stock",
+    cols1 = ["sku", "description", "supplier", "item_class", "current_safety_stock",
              "recommended_safety_stock", "ss_drift_pct", "current_rop",
              "recommended_rop", "lt_drift_pct", "dollar_impact",
              "action", "confidence", "risk_if_ignored", "rationale"]
-    headers1 = ["SKU", "Description", "Class", "Current SS", "Recommended SS",
+    headers1 = ["SKU", "Description", "Supplier", "Class", "Current SS", "Recommended SS",
                 "SS Drift %", "Current ROP", "Recommended ROP", "LT Drift %",
                 "$ Impact", "Agent Action", "Confidence", "Risk if Ignored", "Rationale"]
     ws1.append(headers1)
     for row in review_queue:
         ws1.append([row.get(c, "") for c in cols1])
     _style_header(ws1, len(headers1))
-    widths1 = [10, 24, 7, 11, 15, 10, 12, 15, 10, 11, 18, 11, 30, 50]
+    widths1 = [12, 24, 20, 7, 11, 15, 10, 12, 15, 10, 11, 18, 11, 30, 50]
     for i, w in enumerate(widths1, 1):
         ws1.column_dimensions[get_column_letter(i)].width = w
     for r in range(2, ws1.max_row + 1):
         for c in range(1, len(headers1) + 1):
             ws1.cell(row=r, column=c).font = BODY_FONT
-            ws1.cell(row=r, column=c).alignment = Alignment(wrap_text=(c == 14), vertical="top")
+            ws1.cell(row=r, column=c).alignment = Alignment(wrap_text=(c == 15), vertical="top")
 
     # Sheet 2 — Full Portfolio Scan
     ws2 = wb.create_sheet("Portfolio Scan")
-    cols2 = ["sku", "description", "item_class", "current_safety_stock",
-             "recommended_safety_stock", "ss_drift_pct", "lt_drift_pct",
+    cols2 = ["sku", "description", "supplier", "item_class", "current_safety_stock",
+             "recommended_safety_stock", "ss_drift_pct", "current_rop", "recommended_rop",
+             "recent_weekly_mean", "recent_weekly_std", "lt_actual_mean_days",
+             "lt_actual_std_days", "lt_drift_pct",
              "is_trending", "is_intermittent", "has_outliers", "flagged"]
-    headers2 = ["SKU", "Description", "Class", "Current SS", "Recommended SS",
-                "SS Drift %", "LT Drift %", "Trending?", "Intermittent?",
+    headers2 = ["SKU", "Description", "Supplier", "Class", "Current SS", "Recommended SS",
+                "SS Drift %", "Current ROP", "Recommended ROP", "Avg Weekly Demand",
+                "Demand Std Dev", "Avg LT Days", "LT Std Dev", "LT Drift %", "Trending?", "Intermittent?",
                 "Outliers?", "Flagged for Review?"]
     ws2.append(headers2)
     for row in all_results:
         ws2.append([row.get(c, "") for c in cols2])
     _style_header(ws2, len(headers2))
-    widths2 = [10, 24, 7, 11, 15, 10, 10, 10, 12, 10, 18]
+    widths2 = [12, 24, 20, 7, 11, 15, 10, 12, 15, 16, 15, 12, 12, 10, 10, 12, 10, 18]
     for i, w in enumerate(widths2, 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
     for r in range(2, ws2.max_row + 1):
@@ -292,11 +312,11 @@ class SafetyStockInputError(ValueError):
 
 _REQUIRED_COLUMNS = {
     "item_master.csv": {
-        "sku", "description", "item_class", "assumed_lead_time_days",
+        "sku", "description", "supplier", "item_class", "assumed_lead_time_days",
         "current_safety_stock", "current_rop", "unit_cost",
     },
-    "demand_history.csv": {"sku", "demand_qty"},
-    "receipt_history.csv": {"sku", "actual_lead_time_days"},
+    "demand_history.csv": {"sku", "week", "demand_qty"},
+    "receipt_history.csv": {"sku", "po_number", "actual_lead_time_days"},
 }
 
 _NUMERIC_COLUMNS = {
@@ -332,15 +352,67 @@ def _load_input_data(data_dir: Path):
             raise SafetyStockInputError(f"{filename} contains no data rows.")
         for column in _NUMERIC_COLUMNS[filename]:
             try:
-                pd.to_numeric(frame[column], errors="raise")
+                frame[column] = pd.to_numeric(frame[column], errors="raise")
             except (TypeError, ValueError) as exc:
                 raise SafetyStockInputError(
                     f"{filename} column '{column}' contains a non-numeric value."
                 ) from exc
+        if frame["sku"].isna().any() or frame["sku"].astype(str).str.strip().eq("").any():
+            raise SafetyStockInputError(f"{filename} contains a missing or blank SKU.")
+        frame["sku"] = frame["sku"].astype(str).str.strip()
         frames[filename] = frame
 
-    return (frames["item_master.csv"], frames["demand_history.csv"],
-            frames["receipt_history.csv"])
+    items = frames["item_master.csv"]
+    demand = frames["demand_history.csv"]
+    receipts = frames["receipt_history.csv"]
+
+    if items["supplier"].isna().any() or items["supplier"].astype(str).str.strip().eq("").any():
+        raise SafetyStockInputError("item_master.csv contains a missing or blank supplier.")
+    items["supplier"] = items["supplier"].astype(str).str.strip()
+    if items[list(_NUMERIC_COLUMNS["item_master.csv"])].isna().any().any():
+        raise SafetyStockInputError("item_master.csv contains a null numeric calculation value.")
+    if items["sku"].duplicated().any():
+        duplicates = sorted(items.loc[items["sku"].duplicated(False), "sku"].unique())
+        raise SafetyStockInputError(
+            "item_master.csv must contain one row per SKU. Duplicate SKU(s): "
+            + ", ".join(duplicates[:10])
+        )
+    if demand[["sku", "week"]].duplicated().any():
+        raise SafetyStockInputError("demand_history.csv contains duplicate SKU/week rows.")
+    if receipts["po_number"].isna().any() or receipts["po_number"].astype(str).str.strip().eq("").any():
+        raise SafetyStockInputError("receipt_history.csv contains a missing or blank po_number.")
+    if receipts["po_number"].astype(str).duplicated().any():
+        raise SafetyStockInputError("receipt_history.csv contains duplicate po_number values.")
+    if demand["demand_qty"].isna().any() or (demand["demand_qty"] < 0).any():
+        raise SafetyStockInputError("demand_history.csv demand_qty must be non-null and nonnegative.")
+    if receipts["actual_lead_time_days"].isna().any() or (receipts["actual_lead_time_days"] <= 0).any():
+        raise SafetyStockInputError(
+            "receipt_history.csv actual_lead_time_days must be non-null and positive."
+        )
+    week_text = demand["week"].astype(str).str.strip()
+    numeric_week = pd.to_numeric(week_text, errors="coerce")
+    if numeric_week.isna().any():
+        date_week = pd.to_datetime(week_text, errors="coerce")
+        if date_week.isna().any():
+            raise SafetyStockInputError(
+                "demand_history.csv column 'week' must contain valid week numbers or dates."
+            )
+
+    master_skus = set(items["sku"])
+    for filename, frame in (("demand_history.csv", demand), ("receipt_history.csv", receipts)):
+        unknown = sorted(set(frame["sku"]) - master_skus)
+        missing_history = sorted(master_skus - set(frame["sku"]))
+        if unknown:
+            raise SafetyStockInputError(
+                f"{filename} contains SKU(s) absent from item_master.csv: " + ", ".join(unknown[:10])
+            )
+        if missing_history:
+            raise SafetyStockInputError(
+                f"{filename} has no history for item-master SKU(s): "
+                + ", ".join(missing_history[:10])
+            )
+
+    return items, demand, receipts
 
 
 def run_analysis(data_dir: str | Path = BASE_DIR, api_key: str | None = None,
@@ -396,7 +468,7 @@ def run_analysis(data_dir: str | Path = BASE_DIR, api_key: str | None = None,
                   f"SS drift {sku_data['ss_drift_pct']:+.1f}%, "
                   f"LT drift {sku_data['lt_drift_pct']:+.1f}%...")
         rec = get_agent_recommendation(client, sku_data, report)
-        report(f"{status} → {rec['action']} ({rec['confidence']})")
+        report(f"{status} -> {rec['action']} ({rec['confidence']})")
         review_queue.append({**sku_data, **rec})
 
     # Sort by dollar impact, but push manual_review_needed / low confidence up
@@ -414,6 +486,13 @@ def run_analysis(data_dir: str | Path = BASE_DIR, api_key: str | None = None,
     for r in review_queue:
         action_counts[r["action"]] = action_counts.get(r["action"], 0) + 1
     total_dollar_impact = sum(r["dollar_impact"] for r in review_queue)
+    analysis_summary = {
+        "total_skus": len(all_results),
+        "flagged_count": len(flagged),
+        "auto_cleared_count": len(all_results) - len(flagged),
+        "total_dollar_impact": total_dollar_impact,
+        "action_counts": action_counts,
+    }
 
     report("\n" + "=" * 60)
     report("SUMMARY")
@@ -439,6 +518,11 @@ def run_analysis(data_dir: str | Path = BASE_DIR, api_key: str | None = None,
         "action_counts": action_counts,
         "review_queue": review_queue,
         "all_results": all_results,
+        "analysis_results": all_results,
+        "analysis_summary": analysis_summary,
+        "item_master": items.copy(),
+        "demand_history": demand_hist.copy(),
+        "receipt_history": receipt_hist.copy(),
         "output_path": output_path,
     }
 

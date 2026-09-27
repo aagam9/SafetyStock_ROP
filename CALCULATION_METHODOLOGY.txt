@@ -22,6 +22,8 @@ The analysis uses three CSV data sets.
    One row per SKU. Calculation fields:
    - sku
    - description
+   - supplier (the SKU's primary/current supplier; used for reporting and
+     assistant aggregation, not in the Safety Stock formula)
    - item_class
    - assumed_lead_time_days
    - current_safety_stock
@@ -394,12 +396,12 @@ item because it requires human attention.
 The output workbook is safety_stock_review.xlsx.
 
 Review Queue tab:
-   Contains flagged SKUs, current and recommended settings, drift measures,
-   dollar impact, action, confidence, risk, and rationale.
+   Contains flagged SKUs, supplier, current and recommended settings, drift
+   measures, dollar impact, action, confidence, risk, and rationale.
 
 Portfolio Scan tab:
-   Contains every scanned SKU and its main statistical recommendation and
-   flagging signals.
+   Contains every scanned SKU with supplier, current and recommended Safety
+   Stock/ROP, demand and lead-time statistics, and flagging signals.
 
 
 14. KEY MODEL ASSUMPTIONS AND LIMITATIONS

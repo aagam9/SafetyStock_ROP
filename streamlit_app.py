@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Business-user Streamlit interface for the Safety Stock / ROP Drift Agent."""
 
+import hashlib
+import os
 import re
 import shutil
 import tempfile
@@ -10,6 +12,13 @@ import pandas as pd
 import streamlit as st
 
 from safety_stock_agent import BASE_DIR, SafetyStockInputError, run_analysis
+from inventory_assistant import (
+    InventoryAssistantError,
+    MissingNvidiaAPIKey,
+    ask_inventory_assistant,
+    get_nvidia_config,
+    reset_inventory_session,
+)
 
 
 APP_TITLE = "Safety Stock / ROP Drift Review"
@@ -44,7 +53,7 @@ FILE_GUIDE = pd.DataFrame(
             "One row per": "SKU",
             "Required columns": (
                 "sku, description, item_class, assumed_lead_time_days, "
-                "current_safety_stock, current_rop, unit_cost"
+                "current_safety_stock, current_rop, unit_cost, supplier"
             ),
         },
         {
@@ -67,6 +76,34 @@ def _deployment_api_key():
         return st.secrets["ANTHROPIC_API_KEY"]
     except (FileNotFoundError, KeyError):
         return None
+
+
+def _nvidia_setting(name: str):
+    """Read NVIDIA settings from Streamlit secrets first, then the environment."""
+    try:
+        value = st.secrets[name]
+    except (FileNotFoundError, KeyError):
+        value = os.getenv(name)
+    return str(value).strip() if value else None
+
+
+def reset_analysis_state(state=None):
+    """Clear analysis and chat together so conversations never cross data sets."""
+    state = st.session_state if state is None else state
+    reset_inventory_session(state)
+
+
+def _input_signature(source: str, uploads: dict) -> str:
+    digest = hashlib.sha256(source.encode("utf-8"))
+    if source == "Use bundled sample data":
+        for filename in INPUT_FILES:
+            digest.update((BASE_DIR / filename).read_bytes())
+    else:
+        for filename in INPUT_FILES:
+            upload = uploads.get(filename)
+            digest.update(filename.encode("utf-8"))
+            digest.update(upload.getvalue() if upload else b"<missing>")
+    return digest.hexdigest()
 
 
 def _stage_inputs(run_dir: Path, source: str, uploads: dict):
@@ -110,14 +147,19 @@ def _progress_callback(log_placeholder, progress_bar):
     return report
 
 
-def _save_run_result(result: dict):
+def _save_run_result(result: dict, input_signature: str):
     st.session_state["last_report"] = Path(result["output_path"]).read_bytes()
-    st.session_state["last_summary"] = {
-        "total_skus": result["total_skus"],
-        "flagged_count": result["flagged_count"],
-        "total_dollar_impact": result["total_dollar_impact"],
-        "action_counts": dict(result["action_counts"]),
-    }
+    summary = dict(result["analysis_summary"])
+    st.session_state["last_summary"] = summary
+    st.session_state["analysis_summary"] = summary
+    st.session_state["item_master"] = result["item_master"]
+    st.session_state["demand_history"] = result["demand_history"]
+    st.session_state["receipt_history"] = result["receipt_history"]
+    st.session_state["analysis_results"] = result["analysis_results"]
+    st.session_state["review_queue"] = result["review_queue"]
+    st.session_state["inventory_chat"] = []
+    st.session_state["assistant_metadata"] = {}
+    st.session_state["last_input_signature"] = input_signature
 
 
 def _render_summary():
@@ -150,6 +192,74 @@ def _render_summary():
         "The workbook contains a prioritized Review Queue and a full Portfolio Scan. "
         "Start with the Review Queue tab."
     )
+
+
+def _render_inventory_assistant():
+    st.divider()
+    st.subheader("Ask Your Inventory Data")
+    if not st.session_state.get("analysis_results"):
+        st.info("Run the inventory analysis first to ask questions about your data.")
+        return
+
+    api_key = _nvidia_setting("NVIDIA_API_KEY")
+    model = _nvidia_setting("NVIDIA_MODEL")
+    base_url = _nvidia_setting("NVIDIA_BASE_URL")
+    try:
+        get_nvidia_config(api_key=api_key, model=model, base_url=base_url)
+    except MissingNvidiaAPIKey as exc:
+        st.info(str(exc))
+        return
+
+    st.caption(
+        "Ask about demand, forecasts, Safety Stock, Reorder Point, Stockout Risk, "
+        "receipt lead times, or supplier lead-time performance. Numerical analysis is "
+        "performed in Python; NVIDIA Nemotron explains the grounded results."
+    )
+    chat = st.session_state.setdefault("inventory_chat", [])
+    for message in chat:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            table = message.get("table")
+            if isinstance(table, pd.DataFrame) and not table.empty:
+                st.dataframe(table, hide_index=True, width="stretch")
+
+    question = st.chat_input("Ask a question about this completed analysis")
+    if not question:
+        return
+    previous_history = [{"role": m["role"], "content": m["content"]} for m in chat]
+    chat.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("Calculating evidence and asking NVIDIA Nemotron…"):
+                answer = ask_inventory_assistant(
+                    question=question,
+                    item_master=st.session_state["item_master"],
+                    demand_history=st.session_state["demand_history"],
+                    receipt_history=st.session_state["receipt_history"],
+                    analysis_results=st.session_state["analysis_results"],
+                    chat_history=previous_history,
+                    prior_metadata=st.session_state.get("assistant_metadata"),
+                    api_key=api_key,
+                    model=model,
+                    base_url=base_url,
+                )
+            st.markdown(answer.text)
+            if answer.table is not None and not answer.table.empty:
+                st.dataframe(answer.table, hide_index=True, width="stretch")
+            chat.append({"role": "assistant", "content": answer.text, "table": answer.table})
+            st.session_state["assistant_metadata"] = answer.metadata
+            st.session_state["inventory_chat"] = chat[-12:]
+        except InventoryAssistantError as exc:
+            st.error(str(exc))
+            chat.append({"role": "assistant", "content": str(exc)})
+            st.session_state["inventory_chat"] = chat[-12:]
+        except (ValueError, KeyError) as exc:
+            message = f"I could not analyze that question: {exc}"
+            st.error(message)
+            chat.append({"role": "assistant", "content": message})
+            st.session_state["inventory_chat"] = chat[-12:]
 
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
@@ -231,6 +341,12 @@ if source == "Upload my files":
 else:
     st.info("The bundled 60-SKU sample data will be used. Your local sample files are not modified.")
 
+current_input_signature = _input_signature(source, uploads)
+previous_input_signature = st.session_state.get("last_input_signature")
+if previous_input_signature and current_input_signature != previous_input_signature:
+    reset_analysis_state()
+    st.info("The selected input data changed. Run the analysis to refresh results and start a new chat.")
+
 deployed_key = _deployment_api_key()
 st.subheader("2. Run and download")
 run_clicked = st.button("Run analysis", type="primary")
@@ -240,8 +356,7 @@ if run_clicked:
     if missing:
         st.error("Upload all three required CSV files before running: " + ", ".join(missing))
     else:
-        st.session_state.pop("last_report", None)
-        st.session_state.pop("last_summary", None)
+        reset_analysis_state()
         transient_output = st.empty()
         with transient_output.container():
             status = st.status("Analysis running…", expanded=True)
@@ -258,7 +373,7 @@ if run_clicked:
                     api_key=deployed_key,
                     progress_callback=report_progress,
                 )
-                _save_run_result(result)
+                _save_run_result(result, current_input_signature)
             transient_output.empty()
         except SafetyStockInputError as exc:
             status.update(label="Input files need attention", state="error", expanded=True)
@@ -271,6 +386,7 @@ if run_clicked:
             )
 
 _render_summary()
+_render_inventory_assistant()
 
 st.divider()
 st.caption(
