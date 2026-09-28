@@ -19,6 +19,7 @@ from inventory_assistant import (
     get_nvidia_config,
     reset_inventory_session,
 )
+from inventory_data import InventoryDataModel
 
 
 APP_TITLE = "Safety Stock / ROP Drift Review"
@@ -156,10 +157,49 @@ def _save_run_result(result: dict, input_signature: str):
     st.session_state["demand_history"] = result["demand_history"]
     st.session_state["receipt_history"] = result["receipt_history"]
     st.session_state["analysis_results"] = result["analysis_results"]
+    st.session_state["assistant_data_model"] = InventoryDataModel.build(
+        result["item_master"],
+        result["demand_history"],
+        result["receipt_history"],
+        result["analysis_results"],
+    )
     st.session_state["review_queue"] = result["review_queue"]
     st.session_state["inventory_chat"] = []
     st.session_state["assistant_metadata"] = {}
     st.session_state["last_input_signature"] = input_signature
+
+
+def _render_answer_evidence(evidence: dict | None):
+    """Show deterministic provenance without prompts, credentials, or model reasoning."""
+    if not evidence:
+        return
+    with st.expander("View data used for this answer"):
+        sources = evidence.get("data_sources_used", [])
+        if sources:
+            st.markdown("**Sources used:** " + ", ".join(f"`{source}`" for source in sources))
+        plan = evidence.get("question_plan", {})
+        filters = evidence.get("filters", {})
+        if filters:
+            st.markdown("**Filters**")
+            st.json(filters)
+        operations = plan.get("operations", [])
+        if operations:
+            st.markdown("**Python operations:** " + " → ".join(operations))
+        definitions = evidence.get("definitions", {})
+        if definitions:
+            st.markdown("**Metric definitions**")
+            st.json(definitions)
+        limitations = evidence.get("limitations", [])
+        if limitations:
+            st.markdown("**Limitations**")
+            for limitation in limitations:
+                st.write(f"- {limitation}")
+        debug = evidence.get("debug", {})
+        if debug:
+            st.caption(
+                f"Intent: {debug.get('intent', 'unknown')} · "
+                f"Rows sent to the explanation layer: {debug.get('rows_sent_to_llm', 0)}"
+            )
 
 
 def _render_summary():
@@ -212,7 +252,7 @@ def _render_inventory_assistant():
 
     st.caption(
         "Ask about demand, forecasts, Safety Stock, Reorder Point, Stockout Risk, "
-        "receipt lead times, or supplier lead-time performance. Numerical analysis is "
+        "receipt lead times, or supplier lead-time behavior. Numerical analysis is "
         "performed in Python; NVIDIA Nemotron explains the grounded results."
     )
     chat = st.session_state.setdefault("inventory_chat", [])
@@ -222,6 +262,7 @@ def _render_inventory_assistant():
             table = message.get("table")
             if isinstance(table, pd.DataFrame) and not table.empty:
                 st.dataframe(table, hide_index=True, width="stretch")
+            _render_answer_evidence(message.get("evidence"))
 
     question = st.chat_input("Ask a question about this completed analysis")
     if not question:
@@ -244,11 +285,18 @@ def _render_inventory_assistant():
                     api_key=api_key,
                     model=model,
                     base_url=base_url,
+                    data_model=st.session_state.get("assistant_data_model"),
                 )
             st.markdown(answer.text)
             if answer.table is not None and not answer.table.empty:
                 st.dataframe(answer.table, hide_index=True, width="stretch")
-            chat.append({"role": "assistant", "content": answer.text, "table": answer.table})
+            _render_answer_evidence(answer.evidence)
+            chat.append({
+                "role": "assistant",
+                "content": answer.text,
+                "table": answer.table,
+                "evidence": answer.evidence,
+            })
             st.session_state["assistant_metadata"] = answer.metadata
             st.session_state["inventory_chat"] = chat[-12:]
         except InventoryAssistantError as exc:

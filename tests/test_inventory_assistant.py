@@ -1,5 +1,7 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +9,7 @@ import pandas as pd
 
 from inventory_assistant import (
     MissingNvidiaAPIKey,
+    _read_local_env,
     ask_inventory_assistant,
     build_analytical_context,
     calculate_stockout_risk,
@@ -14,6 +17,7 @@ from inventory_assistant import (
     get_nvidia_config,
     get_sku_summary,
     get_supplier_summary,
+    plan_question,
     rank_rop_gaps,
     rank_safety_stock_gaps,
     reset_inventory_session,
@@ -39,8 +43,10 @@ class InventoryAssistantTests(unittest.TestCase):
     def setUp(self):
         self.items = pd.DataFrame(
             [
-                {"sku": "A", "description": "Alpha", "supplier": "Supplier One"},
-                {"sku": "B", "description": "Beta", "supplier": "Supplier Two"},
+                {"sku": "A", "description": "Alpha", "supplier": "Supplier One",
+                 "item_class": "A", "current_safety_stock": 30, "current_rop": 80},
+                {"sku": "B", "description": "Beta", "supplier": "Supplier Two",
+                 "item_class": "C", "current_safety_stock": 60, "current_rop": 120},
             ]
         )
         self.demand = pd.DataFrame(
@@ -117,14 +123,33 @@ class InventoryAssistantTests(unittest.TestCase):
             "Top 1 Safety Stock increases",
             self.items, self.demand, self.receipts, self.results,
         )
-        self.assertEqual(metadata["intent"], "safety_stock")
+        self.assertEqual(metadata["intent"], "inventory_ranking")
         self.assertEqual(len(table), 1)
         self.assertNotIn("Supplier Two", context)
 
     def test_missing_nvidia_key(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "inventory_assistant.LOCAL_ENV_PATH", Path("missing-test.env")
+        ):
             with self.assertRaises(MissingNvidiaAPIKey):
                 get_nvidia_config()
+
+    def test_local_env_configuration_is_loaded_without_mutating_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text(
+                "NVIDIA_API_KEY=test-local-key\nNVIDIA_MODEL=test-model\n",
+                encoding="utf-8",
+            )
+            values = _read_local_env(env_path)
+            self.assertEqual(values["NVIDIA_MODEL"], "test-model")
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "inventory_assistant.LOCAL_ENV_PATH", env_path
+            ):
+                config = get_nvidia_config()
+                self.assertEqual(config["api_key"], "test-local-key")
+                self.assertEqual(config["model"], "test-model")
+                self.assertNotIn("NVIDIA_API_KEY", os.environ)
 
     def test_mocked_nemotron_receives_grounded_context(self):
         client = FakeClient()
@@ -137,12 +162,75 @@ class InventoryAssistantTests(unittest.TestCase):
         request = client.chat.completions.last_request
         self.assertIn("PYTHON-GENERATED EVIDENCE", request["messages"][-1]["content"])
         self.assertNotIn("test-key", str(request))
+        self.assertEqual(
+            answer.metadata["sources_used"],
+            ["item_master", "demand_history", "receipt_history", "analysis_results"],
+        )
+        self.assertIn("Based on:", answer.text)
 
-    def test_session_reset_removes_analysis_and_chat_only(self):
-        state = {"analysis_results": [1], "inventory_chat": [1], "unrelated": "keep"}
+    def test_source_selection_uses_the_minimum_authoritative_datasets(self):
+        supplier = plan_question("What supplier provides SKU A?", self.items)
+        demand = plan_question("What was demand for SKU A over the last 4 weeks?", self.items)
+        receipts = plan_question("What is average actual lead time for SKU A?", self.items)
+        safety = plan_question("Why should Safety Stock for SKU A increase?", self.items)
+        self.assertEqual(supplier.required_sources, ["item_master"])
+        self.assertEqual(demand.required_sources, ["demand_history"])
+        self.assertEqual(receipts.required_sources, ["receipt_history"])
+        self.assertEqual(
+            safety.required_sources,
+            ["item_master", "demand_history", "receipt_history", "analysis_results"],
+        )
+
+    def test_demand_context_uses_raw_history_not_analysis_summary(self):
+        altered_results = [dict(row) for row in self.results]
+        altered_results[0]["recent_weekly_mean"] = 9999
+        context, table, metadata, _ = build_analytical_context(
+            "What was demand for SKU A over the last 4 weeks?",
+            self.items, self.demand, self.receipts, altered_results,
+        )
+        self.assertEqual(metadata["sources_used"], ["demand_history"])
+        self.assertEqual(table["demand_qty"].tolist(), [12, 13, 14, 15])
+        self.assertNotIn("9999", context)
+
+    def test_follow_up_prefers_focused_sku_and_requeries_current_data(self):
+        _, first_table, first_metadata, _ = build_analytical_context(
+            "Top 1 Safety Stock increases",
+            self.items, self.demand, self.receipts, self.results,
+        )
+        self.assertEqual(first_table.iloc[0]["sku"], "A")
+        changed_demand = self.demand.copy()
+        changed_demand.loc[changed_demand["sku"] == "A", "demand_qty"] = 999
+        context, table, metadata, _ = build_analytical_context(
+            "Why?",
+            self.items, changed_demand, self.receipts, self.results,
+            prior_metadata=first_metadata,
+        )
+        self.assertEqual(metadata["intent"], "sku_profile")
+        self.assertEqual(table.iloc[0]["sku"], "A")
+        self.assertEqual(table.iloc[0]["demand_recent_avg"], 999)
+        self.assertIn("999", context)
+
+    def test_explicit_unknown_sku_is_reported_instead_of_showing_portfolio(self):
+        _, table, metadata, direct = build_analytical_context(
+            "Tell me about SKU UNKNOWN-404",
+            self.items, self.demand, self.receipts, self.results,
+        )
+        self.assertEqual(metadata["intent"], "unknown_entity")
+        self.assertIsNone(table)
+        self.assertIn("Unknown SKU", direct)
+
+    def test_session_reset_removes_raw_analysis_cache_and_chat_together(self):
+        state = {
+            "item_master": [1], "demand_history": [1], "receipt_history": [1],
+            "analysis_results": [1], "inventory_chat": [1], "assistant_metadata": {"focus_sku": "OLD"},
+            "assistant_data_model": object(), "unrelated": "keep",
+        }
         reset_inventory_session(state)
-        self.assertNotIn("analysis_results", state)
-        self.assertNotIn("inventory_chat", state)
+        for key in (
+            "item_master", "demand_history", "receipt_history", "analysis_results",
+            "inventory_chat", "assistant_metadata", "assistant_data_model",
+        ):
+            self.assertNotIn(key, state)
         self.assertEqual(state["unrelated"], "keep")
 
 

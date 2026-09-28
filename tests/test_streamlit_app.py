@@ -19,6 +19,7 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(len(app.session_state["analysis_results"]), 60)
         self.assertEqual(app.session_state["item_master"]["supplier"].nunique(), 6)
+        self.assertEqual(len(app.session_state["assistant_data_model"].sku_view), 60)
         self.assertEqual(app.session_state["inventory_chat"], [])
         self.assertTrue(any(header.value == "Ask Your Inventory Data" for header in app.subheader))
 

@@ -126,8 +126,9 @@ NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 ```
 
 The model and endpoint are centralized in `inventory_assistant.py`. Set the
-variables in the environment before starting Streamlit. `.env.example` is a
-non-secret template; the application does not automatically load `.env` files.
+variables in the environment before starting Streamlit, or copy `.env.example`
+to `.env` and enter the local values. The assistant reads this local `.env`
+directly; process environment variables and Streamlit secrets take precedence.
 
 For Streamlit deployment, the equivalent `.streamlit/secrets.toml` is:
 
@@ -155,9 +156,55 @@ The grounded assistant supports:
 - an explainable relative **Stockout Risk** ranking
 - receipt lead-time averages and variability
 - unusually long/inconsistent receipt behavior
-- supplier lead-time performance and consistency
+- supplier lead-time behavior and consistency
 - supplier and SKU comparisons
 - bounded conversational follow-ups
+
+## Relationship-aware assistant data model
+
+The assistant has four evidence sources from the latest successful run:
+
+1. `item_master`: one current row per SKU; description, ABC class, current
+   primary supplier, current planning parameters, and cost.
+2. `demand_history`: period-level demand facts used for recent windows,
+   historical averages, variability, intermittency, and forecasts.
+3. `receipt_history`: PO-level actual lead-time facts used for receipt counts,
+   averages, medians, variability, ranges, and long-lead-time outliers.
+4. `analysis_results`: calculated Safety Stock/ROP recommendations, gaps,
+   service assumptions, flags, and analysis conclusions.
+
+SKU is the primary relationship key. Supplier-to-SKU membership comes from
+`item_master.supplier`, which represents the SKU's current primary supplier.
+The assistant uses `analysis_results` as enrichment rather than as a substitute
+for the three uploaded sources.
+
+Demand and receipt histories are both many-row fact tables. They are never
+joined directly on SKU because doing so would multiply rows (for example, 104
+demand periods by 15 receipts would create 1,560 incorrect rows). Instead,
+`inventory_data.py` independently aggregates each history to one row per SKU,
+validates that grain, and then joins those summaries to the one-row-per-SKU
+item master and analysis results. Supplier rollups traverse this validated SKU
+view or aggregate individual receipt records explicitly.
+
+Each question creates a source plan before calculations run. Examples:
+
+- supplier lookup: `item_master` only
+- recent demand: `demand_history`
+- actual lead time: `receipt_history`
+- Safety Stock explanation: all three uploaded sources plus `analysis_results`
+- supplier/cross-domain rankings: independently aggregated SKU metrics combined
+  at SKU grain
+
+Nemotron receives only the resulting question-specific evidence. Answers include
+a compact **Based on** section, and the Streamlit **View data used for this
+answer** expander shows sources, filters, approved Python operations, metric
+definitions, limitations, and the number of result rows sent for explanation.
+
+The derived demand summary, receipt summary, and cross-file SKU view are cached
+in the current Streamlit session as `assistant_data_model`; supplier rollups are
+computed from that validated model.
+They are invalidated together with the raw data and chat when uploads change or
+a new analysis runs. LLM prose is never cached as authoritative data.
 
 Forecasts use up to the latest 13 observations, fit a simple linear trend, and
 damp that trend by 50%. They are transparent planning estimates rather than
@@ -171,8 +218,11 @@ criticality. It is not a probability of stockout.
 
 - The inputs do not contain inventory-position history, backorders, or explicit
   stockout events. The app cannot report historical stockout counts.
-- Supplier analysis is currently lead-time performance and consistency, not a
+- Supplier analysis is currently lead-time behavior and consistency, not a
   complete supplier scorecard.
+- Receipt history has no order or receipt date. The assistant therefore does
+  not claim recent supplier slowdown or lead-time trend from PO number or row
+  order.
 - OTIF, fill rate, quality, and promised-date adherence require fields that are
   not present in the current schemas.
 - Forecasts are estimates based only on uploaded demand history; they do not
@@ -189,7 +239,9 @@ The test suite uses no real NVIDIA calls and requires no API key:
 python -m unittest discover -s tests -v
 ```
 
-Coverage includes supplier validation/joining, SKU retrieval, supplier
-aggregation, deterministic forecasts, Safety Stock/ROP rankings, Stockout Risk,
-unsupported-data responses, context construction, session reset, missing NVIDIA
-configuration, and a mocked Nemotron call.
+Coverage includes supplier validation/joining, one-row-per-SKU demand and receipt
+aggregation, many-to-many inflation prevention, source selection, raw-history
+authority, missing-history behavior, supplier relationships, deterministic
+forecasts, Safety Stock/ROP rankings, Stockout Risk, unsupported-data responses,
+context construction, cache/session reset, missing NVIDIA configuration, and a
+mocked Nemotron call.
