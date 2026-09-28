@@ -178,6 +178,17 @@ def _render_answer_evidence(evidence: dict | None):
         if sources:
             st.markdown("**Sources used:** " + ", ".join(f"`{source}`" for source in sources))
         plan = evidence.get("question_plan", {})
+        if plan:
+            st.markdown("**Parsed question plan**")
+            st.json({
+                key: plan.get(key)
+                for key in (
+                    "query_type", "entity_type", "skus", "suppliers", "metric",
+                    "metrics", "direction", "limit", "conditions", "time_window",
+                    "confidence",
+                )
+                if plan.get(key) not in (None, [], {})
+            })
         filters = evidence.get("filters", {})
         if filters:
             st.markdown("**Filters**")

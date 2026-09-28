@@ -18,6 +18,12 @@ import numpy as np
 import pandas as pd
 
 from inventory_data import InventoryDataError, InventoryDataModel
+from inventory_question_parser import (
+    LanguageInterpretation,
+    extract_unresolved_sku_candidate,
+    interpret_inventory_question,
+    validate_interpretation_payload,
+)
 
 
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
@@ -68,6 +74,14 @@ class QuestionPlan:
     time_window: int | None
     required_sources: list[str]
     operations: list[str]
+    query_type: str = "lookup"
+    entity_type: str = "sku"
+    metric: str | None = None
+    metrics: list[str] = field(default_factory=list)
+    direction: str | None = None
+    limit: int = 10
+    conditions: list[str] = field(default_factory=list)
+    confidence: str = "high"
     filters: dict[str, Any] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
     ambiguous_entities: list[str] = field(default_factory=list)
@@ -353,7 +367,21 @@ def _resolve_entities(
 ) -> tuple[list[str], list[str], list[str]]:
     q = question.casefold()
     normalized_q = _normalize_entity(question)
-    skus = [str(value) for value in item_master["sku"].dropna().unique() if _boundary_match(q, str(value))]
+    skus: list[str] = []
+    for value in item_master["sku"].dropna().unique():
+        sku = str(value)
+        normalized_sku = _normalize_entity(sku)
+        # Very short codes such as A/B are valid only with explicit SKU syntax;
+        # otherwise ordinary prose and "A-class" would create false matches.
+        if len(normalized_sku) < 3:
+            explicitly_named = bool(re.search(
+                rf"\bsku(?:\s+(?:code|id|number))?\s*[:#]?\s+{re.escape(sku.casefold())}\b",
+                q,
+            ))
+            if explicitly_named or q.strip(" ?.!") == sku.casefold():
+                skus.append(sku)
+        elif _boundary_match(q, sku):
+            skus.append(sku)
     suppliers = [
         str(value) for value in item_master["supplier"].dropna().unique()
         if _boundary_match(q, str(value))
@@ -364,11 +392,12 @@ def _resolve_entities(
         if len(description) >= 4 and _boundary_match(q, description):
             skus.append(str(row["sku"]))
 
-    # Normalized SKU matching handles punctuation/case differences.
+    # Normalized matching is only applied to known, sufficiently distinctive
+    # identifiers. Arbitrary words are never promoted to SKU values.
     if not skus:
         normalized_matches = [
             str(value) for value in item_master["sku"].dropna().unique()
-            if len(_normalize_entity(str(value))) >= 3
+            if len(_normalize_entity(str(value))) >= 4
             and _normalize_entity(str(value)) in normalized_q
         ]
         skus.extend(normalized_matches)
@@ -386,24 +415,51 @@ def _resolve_entities(
         elif len(set(alias_matches)) > 1:
             ambiguous.append("supplier: " + ", ".join(sorted(set(alias_matches))))
 
-    is_follow_up = bool(re.fullmatch(
-        r"\s*(why\??|explain|tell me more|what about (it|its .+)|and (it|that one)\??)\s*",
-        q,
-    ))
+    # If the same unqualified phrase can name both an SKU/description and a
+    # supplier alias, do not guess. Explicit "SKU ..." or "Supplier ..."
+    # phrasing disambiguates it.
+    if skus and suppliers:
+        sku_labels: set[str] = set()
+        for sku in skus:
+            sku_labels.add(_normalize_entity(sku))
+            descriptions = item_master.loc[item_master["sku"].astype(str) == sku, "description"]
+            sku_labels.update(_normalize_entity(value) for value in descriptions.dropna())
+        supplier_labels: set[str] = set()
+        for supplier in suppliers:
+            supplier_labels.add(_normalize_entity(supplier))
+            alias = re.sub(r"^(supplier|vendor)\s+", "", supplier, flags=re.I).strip()
+            supplier_labels.add(_normalize_entity(alias))
+        collisions = {value for value in sku_labels & supplier_labels if len(value) >= 3}
+        explicit_sku_type = bool(re.search(r"\bsku\s+[a-z0-9]", q))
+        explicit_supplier_type = bool(re.search(r"\b(supplier|vendor)\s+[a-z0-9]", q))
+        if collisions:
+            if explicit_supplier_type and not explicit_sku_type:
+                skus = []
+            elif explicit_sku_type and not explicit_supplier_type:
+                suppliers = []
+            elif not explicit_sku_type and not explicit_supplier_type:
+                ambiguous.append(
+                    "entity may refer to an SKU/description or supplier: "
+                    + ", ".join(sorted(collisions))
+                )
+                skus = []
+                suppliers = []
+
     prior = dict(prior_metadata or {})
+    references_prior = bool(
+        re.fullmatch(r"\s*(why\??|explain|tell me more)\s*", q)
+        or re.search(r"\b(it|its|that one|this sku|that sku|this item|that item)\b", q)
+    )
     resolved_follow_up_sku = False
-    if is_follow_up and not skus:
-        focus_sku = prior.get("focus_sku")
-        if focus_sku:
-            skus = [str(focus_sku)]
-            resolved_follow_up_sku = True
-        else:
-            skus = [str(value) for value in prior.get("skus", [])[:1]]
-            resolved_follow_up_sku = bool(skus)
+    if references_prior:
+        focus_sku = prior.get("focus_sku") or next(iter(prior.get("skus", [])), None)
+        if focus_sku and str(focus_sku) not in skus:
+            skus.append(str(focus_sku))
+        resolved_follow_up_sku = bool(skus)
     # A ranked result may carry both SKU and supplier metadata. Pronouns such as
     # "it" and a bare "Why?" refer to the focused SKU first; only fall back to
     # supplier context when there is no focused SKU.
-    if is_follow_up and not suppliers and not resolved_follow_up_sku and not skus:
+    if references_prior and not suppliers and not resolved_follow_up_sku and not skus:
         focus_supplier = prior.get("focus_supplier")
         if focus_supplier:
             suppliers = [str(focus_supplier)]
@@ -433,17 +489,58 @@ def plan_question(
     question: str,
     item_master: pd.DataFrame,
     prior_metadata: Mapping[str, Any] | None = None,
+    interpretation_override: LanguageInterpretation | None = None,
 ) -> QuestionPlan:
     """Create a validated plan selecting only approved sources and operations."""
     q = question.casefold()
     skus, suppliers, ambiguous = _resolve_entities(question, item_master, prior_metadata)
     window = _time_window(question)
-    explicit_sku = re.search(r"\bsku\s+([a-z0-9][a-z0-9._/-]*)", question, re.I)
-    if explicit_sku and not skus:
-        unknown = explicit_sku.group(1).rstrip("?.!,")
+    interpretation = interpretation_override or interpret_inventory_question(
+        question, sku_count=len(skus), supplier_count=len(suppliers), maximum_rows=MAX_CONTEXT_ROWS
+    )
+
+    def make_plan(
+        intent: str,
+        sources: list[str],
+        operations: list[str],
+        *,
+        limitations: list[str] | None = None,
+    ) -> QuestionPlan:
+        filters: dict[str, Any] = {}
+        if suppliers:
+            filters["supplier"] = suppliers
+        if skus:
+            filters["sku"] = skus
+        if re.search(r"\b(?:class\s+)?a(?:-class)?\b", q):
+            filters["item_class"] = "A"
         return QuestionPlan(
-            "unknown_entity", [], suppliers, window, ["item_master"],
-            ["resolve_sku"], limitations=[f"Unknown SKU: {unknown}"],
+            intent=intent,
+            skus=skus,
+            suppliers=suppliers,
+            time_window=window,
+            required_sources=list(dict.fromkeys(sources)),
+            operations=operations,
+            query_type=interpretation.query_type,
+            entity_type=interpretation.entity_type,
+            metric=interpretation.metric,
+            metrics=list(interpretation.metrics),
+            direction=interpretation.direction,
+            limit=interpretation.limit,
+            conditions=list(interpretation.conditions),
+            confidence=interpretation.confidence,
+            filters=filters,
+            limitations=list(limitations or []),
+            ambiguous_entities=ambiguous,
+        )
+
+    if ambiguous:
+        return make_plan("clarification", [], ["resolve_ambiguous_entity"])
+
+    unresolved_sku = extract_unresolved_sku_candidate(question)
+    if unresolved_sku and not skus:
+        return make_plan(
+            "unknown_entity", ["item_master"], ["resolve_sku"],
+            limitations=[f"Unknown SKU: {unresolved_sku}"],
         )
     unsupported = re.search(r"\b(otif|fill rate|quality|promised[- ]date|on[- ]time delivery)\b", q)
     historical_stockout = (
@@ -452,103 +549,132 @@ def plan_question(
         and "risk" not in q
     )
     if unsupported or historical_stockout:
-        return QuestionPlan("unsupported", skus, suppliers, window, [], ["report_limitation"], ambiguous_entities=ambiguous)
+        return make_plan("unsupported", [], ["report_limitation"])
 
-    # Generic "variability" may describe receipt lead times, so demand-oriented
-    # questions must use an explicit demand/forecast term (or a demand trend term).
-    has_demand = bool(re.search(r"demand|forecast|intermittent|growing|rising|declining", q))
-    has_receipt = bool(re.search(r"receipt|shipment|lead[ -]?time|purchase order|\bpo\b|supply", q))
-    has_ss = bool(re.search(r"safety stock|\bss\b|under[- ]protected|over[- ]protected", q))
-    has_rop = bool(re.search(r"reorder point|\brop\b", q))
-    has_risk = bool(re.search(r"stockout|risk|exposed", q))
-    is_compare = "compare" in q or " versus " in q or " vs " in q
-    asks_about_suppliers = bool(re.search(r"\bsuppliers?\b|\bvendors?\b", q))
+    metric = interpretation.metric
+    metrics = set(interpretation.metrics)
+    asks_for_supplier = bool(re.search(
+        r"\b(what|which)\s+supplier\b|\bwho\s+supplies\b|\bwhat\s+vendor\b|\bsupplier\s+is\s+it\s+from\b",
+        q,
+    ))
+    if skus and asks_for_supplier and len(skus) == 1 and interpretation.query_type != "comparison":
+        return make_plan("supplier_lookup", ["item_master"], ["lookup_item_master"])
 
-    if re.search(r"forecast|predict|projection|next \d+ (?:weeks?|periods?)", q):
-        intent = "forecast"
-        sources = ["demand_history"]
-        operations = ["resolve_sku", "fit_deterministic_forecast"]
-    elif skus and re.search(r"what supplier|which supplier|who supplies|provides?\s+(?:sku\s+)?|belong", q):
-        intent = "supplier_lookup"
+    if interpretation.query_type == "forecast":
+        return make_plan("forecast", ["demand_history"], ["resolve_sku", "fit_deterministic_forecast"])
+    if interpretation.query_type == "comparison":
+        if len(suppliers) >= 2 and not skus:
+            return make_plan(
+                "supplier_comparison",
+                ["item_master", "demand_history", "receipt_history", "analysis_results"],
+                ["resolve_supplier_skus", "aggregate_each_fact_by_sku", "compare_supplier_profiles"],
+            )
+        if len(skus) >= 2:
+            return make_plan(
+                "sku_comparison",
+                ["item_master", "demand_history", "receipt_history", "analysis_results"],
+                ["build_sku_profiles", "compare_profiles"],
+            )
+        return make_plan(
+            "clarification", [], ["request_comparison_entities"],
+            limitations=["Please specify two known SKUs or two known suppliers to compare."],
+        )
+
+    domains = set()
+    if metrics & {"demand_variability", "demand_level", "demand_trend"}:
+        domains.add("demand")
+    if metrics & {"lead_time_variability", "lead_time_mean"}:
+        domains.add("receipt")
+    if metrics & {"safety_stock_gap", "rop_gap", "stockout_risk"}:
+        domains.add("inventory")
+    cross_file = len(domains) >= 2
+
+    if cross_file:
         sources = ["item_master"]
-        operations = ["lookup_item_master"]
-    elif is_compare and len(suppliers) >= 2:
-        intent = "supplier_comparison"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["resolve_supplier_skus", "aggregate_each_fact_by_sku", "compare_supplier_profiles"]
-    elif is_compare and len(skus) >= 2:
-        intent = "sku_comparison"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["build_sku_profiles", "compare_profiles"]
-    elif asks_about_suppliers and not suppliers and (has_ss or has_rop or has_risk):
-        intent = "supplier_overview"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["build_supplier_profiles", "rank_suppliers"]
-    elif has_ss and has_demand and not skus:
-        intent = "cross_file_risk"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["aggregate_demand_by_sku", "aggregate_receipts_by_sku", "combine_at_sku_grain", "filter_and_rank"]
-    elif has_ss and suppliers:
-        intent = "supplier_inventory"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["resolve_supplier_skus", "aggregate_each_fact_by_sku", "rank_safety_stock_gaps"]
-    elif has_ss:
-        intent = "sku_safety_stock" if skus else "inventory_ranking"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["build_sku_profile", "explain_safety_stock_drivers"] if skus else ["rank_safety_stock_gaps"]
-    elif has_rop:
-        intent = "sku_rop" if skus else "inventory_ranking"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["build_sku_profile", "explain_rop_drivers"] if skus else ["rank_rop_gaps"]
-    elif has_demand and has_receipt:
-        intent = "cross_file_risk"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["aggregate_demand_by_sku", "aggregate_receipts_by_sku", "combine_at_sku_grain", "filter_and_rank"]
-    elif suppliers and has_demand:
-        intent = "supplier_demand"
-        sources = ["item_master", "demand_history"]
-        operations = ["resolve_supplier_skus", "aggregate_demand_by_sku", "filter_and_rank"]
-    elif suppliers and has_receipt:
-        intent = "supplier_receipts"
-        sources = ["item_master", "receipt_history"]
-        operations = ["resolve_supplier_skus", "aggregate_receipts_by_sku", "filter_and_rank"]
-    elif suppliers and re.search(r"what skus|which skus|products|items", q):
-        intent = "supplier_skus"
-        sources = ["item_master"]
-        operations = ["resolve_supplier_skus"]
-    elif suppliers or asks_about_suppliers:
-        intent = "supplier_overview"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["build_supplier_profiles", "rank_suppliers"]
-    elif has_receipt:
-        intent = "sku_receipts" if skus else "receipt_ranking"
-        sources = ["receipt_history"] + (["item_master"] if not skus else [])
-        operations = ["aggregate_receipts_by_sku", "retrieve_receipt_metrics"]
-    elif has_demand:
-        intent = "sku_demand" if skus else "demand_ranking"
-        sources = ["demand_history"] + (["item_master"] if not skus else [])
-        operations = ["select_time_window", "aggregate_demand_by_sku", "filter_and_rank"]
-    elif has_risk:
-        intent = "stockout_risk"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["aggregate_each_fact_by_sku", "calculate_relative_stockout_risk", "rank"]
-    elif skus:
-        intent = "sku_profile"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["build_sku_profile"]
-    else:
-        intent = "general_inventory"
-        sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
-        operations = ["aggregate_each_fact_by_sku", "rank_portfolio_risk"]
+        if "demand" in domains:
+            sources.append("demand_history")
+        if "receipt" in domains:
+            sources.append("receipt_history")
+        if "inventory" in domains:
+            sources.append("analysis_results")
+        return make_plan(
+            "cross_file_risk", sources,
+            ["aggregate_required_facts_by_sku", "combine_at_sku_grain", "apply_conditions", "rank"],
+        )
 
-    filters: dict[str, Any] = {}
-    if suppliers:
-        filters["supplier"] = suppliers
+    if metric in {"safety_stock_gap", "rop_gap"}:
+        if skus:
+            intent = "sku_safety_stock" if metric == "safety_stock_gap" else "sku_rop"
+            sources = ["item_master", "demand_history", "receipt_history", "analysis_results"]
+            return make_plan(intent, sources, ["build_sku_profile", "explain_inventory_drivers"])
+        if suppliers and interpretation.entity_type == "sku":
+            return make_plan(
+                "supplier_inventory", ["item_master", "analysis_results"],
+                ["resolve_supplier_skus", "rank_inventory_gaps"],
+            )
+        if interpretation.entity_type == "supplier":
+            return make_plan(
+                "supplier_overview", ["item_master", "analysis_results"],
+                ["build_supplier_profiles", "rank_suppliers"],
+            )
+        return make_plan(
+            "inventory_ranking", ["item_master", "analysis_results"],
+            ["rank_safety_stock_gaps" if metric == "safety_stock_gap" else "rank_rop_gaps"],
+        )
+
+    if metric in {"lead_time_variability", "lead_time_mean"}:
+        if interpretation.entity_type == "supplier" and not skus:
+            return make_plan(
+                "supplier_overview", ["item_master", "receipt_history"],
+                ["map_receipts_to_current_supplier", "rank_supplier_lead_time_metric"],
+            )
+        if skus:
+            return make_plan("sku_receipts", ["receipt_history"], ["retrieve_receipt_metrics"])
+        if suppliers:
+            return make_plan(
+                "supplier_receipts", ["item_master", "receipt_history"],
+                ["resolve_supplier_skus", "aggregate_receipts_by_sku", "rank"],
+            )
+        return make_plan(
+            "receipt_ranking", ["receipt_history"],
+            ["aggregate_receipts_by_sku", "rank_lead_time_metric"],
+        )
+
+    if metric in {"demand_variability", "demand_level", "demand_trend"}:
+        if skus:
+            return make_plan("sku_demand", ["demand_history"], ["select_time_window", "calculate_demand_metrics"])
+        if suppliers:
+            return make_plan(
+                "supplier_demand", ["item_master", "demand_history"],
+                ["resolve_supplier_skus", "aggregate_demand_by_sku", "rank"],
+            )
+        return make_plan(
+            "demand_ranking", ["demand_history"],
+            ["aggregate_demand_by_sku", "rank_demand_metric"],
+        )
+
+    if metric == "stockout_risk":
+        return make_plan(
+            "stockout_risk", ["item_master", "demand_history", "receipt_history", "analysis_results"],
+            ["aggregate_each_fact_by_sku", "calculate_relative_stockout_risk", "rank"],
+        )
+
+    if suppliers and interpretation.entity_type == "sku":
+        return make_plan("supplier_skus", ["item_master"], ["resolve_supplier_skus"])
+    if suppliers or interpretation.entity_type == "supplier":
+        return make_plan(
+            "supplier_overview", ["item_master", "demand_history", "receipt_history", "analysis_results"],
+            ["build_supplier_profiles"],
+        )
     if skus:
-        filters["sku"] = skus
-    if re.search(r"\b(?:class\s+)?a(?:-class)?\b", q):
-        filters["item_class"] = "A"
-    return QuestionPlan(intent, skus, suppliers, window, sources, operations, filters, ambiguous_entities=ambiguous)
+        return make_plan(
+            "sku_profile", ["item_master", "demand_history", "receipt_history", "analysis_results"],
+            ["build_sku_profile"],
+        )
+    return make_plan(
+        "clarification", [], ["request_metric_or_entity"],
+        limitations=[interpretation.clarification or "Please specify an inventory metric or entity."],
+    )
 
 
 def detect_intent(question: str, prior_intent: str | None = None) -> str:
@@ -600,8 +726,28 @@ def _filter_view(view: pd.DataFrame, plan: QuestionPlan) -> pd.DataFrame:
     return result
 
 
-def _cross_file_ranking(view: pd.DataFrame, question: str, limit: int) -> tuple[pd.DataFrame, dict]:
-    q = question.casefold()
+def _apply_single_domain_conditions(frame: pd.DataFrame, plan: QuestionPlan) -> pd.DataFrame:
+    """Apply deterministic percentile/trend filters within the selected scope."""
+    result = frame.copy()
+    conditions = set(plan.conditions)
+    if "high_demand_variability" in conditions:
+        result = result.loc[result["demand_cv"] >= result["demand_cv"].quantile(0.75)]
+    if "stable_demand" in conditions:
+        result = result.loc[result["demand_cv"] <= result["demand_cv"].quantile(0.25)]
+    if "increasing_demand" in conditions:
+        result = result.loc[result["demand_trend"] == "increasing"]
+    if "high_lead_time_variability" in conditions:
+        result = result.loc[result["lead_time_cv"] >= result["lead_time_cv"].quantile(0.75)]
+    if "stable_lead_time" in conditions:
+        result = result.loc[result["lead_time_cv"] <= result["lead_time_cv"].quantile(0.25)]
+    if "long_lead_time" in conditions:
+        result = result.loc[result["lead_time_mean"] > result["lead_time_mean"].mean()]
+    return result
+
+
+def _cross_file_ranking(
+    view: pd.DataFrame, plan: QuestionPlan, limit: int
+) -> tuple[pd.DataFrame, dict]:
     result = view.copy()
     demand_high = result["demand_cv"].quantile(0.75)
     demand_low = result["demand_cv"].quantile(0.25)
@@ -615,31 +761,49 @@ def _cross_file_ranking(view: pd.DataFrame, question: str, limit: int) -> tuple[
         "increasing_demand": "recent 8-period average is more than 10% above the prior comparable period",
         "low_current_safety_stock": "current Safety Stock at or below the selected portfolio's 25th percentile",
     }
-    if re.search(r"rising|increas|growing", q):
+    conditions = set(plan.conditions)
+    if "increasing_demand" in conditions:
         result = result.loc[result["demand_trend"] == "increasing"]
-    if re.search(r"highly variable lead|unstable lead|inconsistent receipt|supply.*risk", q):
+    if "high_lead_time_variability" in conditions:
         result = result.loc[result["lead_time_cv"] >= lead_high]
-    if re.search(r"stable (?:historical )?demand", q):
+    if "stable_demand" in conditions:
         result = result.loc[result["demand_cv"] <= demand_low]
-    elif re.search(r"volatile demand|demand.*volatile", q):
+    elif "high_demand_variability" in conditions:
         result = result.loc[result["demand_cv"] >= demand_high]
-    if re.search(r"stable lead|consistent receipt", q):
+    if "stable_lead_time" in conditions:
         result = result.loc[result["lead_time_cv"] <= lead_low]
-    if re.search(r"longer-than-average|longer than average", q):
+    if "long_lead_time" in conditions:
         result = result.loc[result["lead_time_mean"] > view["lead_time_mean"].mean()]
-    if re.search(r"low current safety stock|low safety stock|low current ss", q):
+    if "positive_safety_stock_gap" in conditions:
+        result = result.loc[result["safety_stock_gap"] > 0]
+    if "positive_rop_gap" in conditions:
+        result = result.loc[result["rop_gap"] > 0]
+    if "low_current_safety_stock" in conditions:
         low_ss = view["current_safety_stock"].quantile(0.25)
         result = result.loc[result["current_safety_stock"] <= low_ss]
-    if re.search(r"both|demand side.*supply|risk from.*demand.*supply", q) and result.equals(view):
+    if {"demand_variability", "lead_time_variability"}.issubset(set(plan.metrics)) and not (
+        {"high_demand_variability", "high_lead_time_variability"} & conditions
+    ):
         result = result.loc[(result["demand_cv"] >= demand_high) & (result["lead_time_cv"] >= lead_high)]
-    sort_column = "safety_stock_gap" if "safety stock" in q or re.search(r"\bss\b", q) else "stockout_risk_score"
+    sort_columns = {
+        "demand_variability": "demand_cv",
+        "demand_level": "demand_mean",
+        "demand_trend": "demand_change_pct",
+        "lead_time_variability": "lead_time_std",
+        "lead_time_mean": "lead_time_mean",
+        "safety_stock_gap": "safety_stock_gap",
+        "rop_gap": "rop_gap",
+        "stockout_risk": "stockout_risk_score",
+    }
+    sort_column = sort_columns.get(plan.metric, "stockout_risk_score")
+    ascending = plan.direction == "ascending"
     columns = [
         "sku", "description", "supplier", "item_class", "demand_recent_avg",
         "demand_previous_avg", "demand_change_pct", "demand_trend", "demand_cv",
         "lead_time_mean", "lead_time_std", "lead_time_cv", "current_safety_stock",
         "recommended_safety_stock", "safety_stock_gap", "stockout_risk_score",
     ]
-    return _columns(result.sort_values(sort_column, ascending=False).head(limit), columns), definitions
+    return _columns(result.sort_values(sort_column, ascending=ascending).head(limit), columns), definitions
 
 
 def _provenance_lines(sources: Sequence[str]) -> str:
@@ -660,7 +824,7 @@ def _build_evidence(
     model: InventoryDataModel,
 ) -> tuple[dict[str, Any], pd.DataFrame | None, str | None, list[str], dict[str, Any]]:
     q = question.casefold()
-    limit = _limit_from_question(question)
+    limit = plan.limit
     facts: dict[str, Any] = {}
     definitions: dict[str, Any] = {}
     limitations = list(plan.limitations)
@@ -670,6 +834,8 @@ def _build_evidence(
     if plan.ambiguous_entities:
         direct_answer = "The entity reference is ambiguous. Please specify one of: " + "; ".join(plan.ambiguous_entities)
         limitations.append("No data query was executed because entity resolution was ambiguous.")
+    elif plan.intent == "clarification":
+        direct_answer = limitations[0] if limitations else "Please clarify the metric or entity you want analyzed."
     elif plan.intent == "unknown_entity":
         direct_answer = plan.limitations[0] + ". Please check the identifier and try again."
     elif plan.intent == "unsupported":
@@ -764,18 +930,25 @@ def _build_evidence(
         if not plan.suppliers:
             direct_answer = "Please specify a known supplier."
         else:
-            rows = _filter_view(model.sku_view, plan)
+            rows = _apply_single_domain_conditions(_filter_view(model.sku_view, plan), plan)
             if plan.intent == "supplier_demand":
-                if re.search(r"increas|growing|rising", q):
-                    rows = rows.loc[rows["demand_trend"] == "increasing"]
-                table = _columns(rows.sort_values("demand_cv", ascending=False), [
+                demand_sort = {
+                    "demand_level": "demand_mean",
+                    "demand_trend": "demand_change_pct",
+                }.get(plan.metric, "demand_cv")
+                table = _columns(rows.sort_values(
+                    demand_sort, ascending=plan.direction == "ascending"
+                ), [
                     "sku", "description", "supplier", "item_class", "demand_mean",
                     "demand_recent_avg", "demand_previous_avg", "demand_change_pct",
                     "demand_trend", "demand_std", "demand_cv",
                 ]).head(limit)
                 definitions["demand_cv"] = "demand standard deviation divided by mean demand"
             elif plan.intent == "supplier_receipts":
-                table = _columns(rows.sort_values("lead_time_cv", ascending=False), [
+                receipt_sort = "lead_time_mean" if plan.metric == "lead_time_mean" else "lead_time_std"
+                table = _columns(rows.sort_values(
+                    receipt_sort, ascending=plan.direction == "ascending"
+                ), [
                     "sku", "description", "supplier", "item_class", "receipt_count",
                     "lead_time_mean", "lead_time_median", "lead_time_std", "lead_time_cv",
                     "lead_time_min", "lead_time_max", "lead_time_outlier_count",
@@ -816,10 +989,18 @@ def _build_evidence(
             summary = summary.sort_values("under_protected_a_skus", ascending=False)
         elif "safety stock" in q or re.search(r"\bss\b", q):
             summary = summary.sort_values("total_positive_safety_stock_gap_units", ascending=False)
-        elif "consistent" in q or "variab" in q:
-            summary = summary.sort_values("receipt_level_lead_time_cv", ascending=True)
-        elif "risk" in q:
-            summary = summary.sort_values("average_stockout_risk_score_across_skus", ascending=False)
+        elif plan.metric == "lead_time_variability":
+            summary = summary.sort_values(
+                "receipt_level_lead_time_std_days", ascending=plan.direction == "ascending"
+            )
+        elif plan.metric == "lead_time_mean":
+            summary = summary.sort_values(
+                "receipt_weighted_average_lead_time_days", ascending=plan.direction == "ascending"
+            )
+        elif plan.metric == "stockout_risk":
+            summary = summary.sort_values(
+                "average_stockout_risk_score_across_skus", ascending=plan.direction == "ascending"
+            )
         table = summary.head(limit)
         facts["supplier_profiles"] = _records(table)
         definitions.update({
@@ -838,13 +1019,14 @@ def _build_evidence(
         ])
         facts["sku_comparison"] = _records(table)
     elif plan.intent == "demand_ranking":
-        rows = _filter_view(model.sku_view, plan)
-        if re.search(r"increas|growing|rising", q):
+        rows = _apply_single_domain_conditions(_filter_view(model.sku_view, plan), plan)
+        if "increasing_demand" in plan.conditions or plan.metric == "demand_trend":
             rows = rows.loc[rows["demand_trend"] == "increasing"].sort_values(
-                "demand_change_pct", ascending=False
+                "demand_change_pct", ascending=plan.direction == "ascending"
             )
         else:
-            rows = rows.sort_values("demand_cv", ascending=False)
+            demand_sort = "demand_mean" if plan.metric == "demand_level" else "demand_cv"
+            rows = rows.sort_values(demand_sort, ascending=plan.direction == "ascending")
         table = _columns(rows, [
             "sku", "description", "supplier", "item_class", "demand_history_points",
             "demand_mean", "demand_std", "demand_cv", "demand_recent_avg",
@@ -852,27 +1034,34 @@ def _build_evidence(
         ]).head(limit)
         facts["demand_ranking"] = _records(table)
     elif plan.intent == "receipt_ranking":
-        rows = _filter_view(model.sku_view, plan)
+        rows = _apply_single_domain_conditions(_filter_view(model.sku_view, plan), plan)
         if re.search(r"recent|trend|slower|faster|increas|decreas", q):
             limitations.append(
                 "receipt_history has no order/receipt date; recent lead-time direction cannot be established."
             )
-        sort_col = "lead_time_cv" if re.search(r"variab|inconsistent|consistent", q) else "lead_time_mean"
-        table = _columns(rows.sort_values(sort_col, ascending=False), [
-            "sku", "description", "supplier", "item_class", "receipt_count",
+        sort_col = "lead_time_std" if plan.metric == "lead_time_variability" else "lead_time_mean"
+        table = _columns(rows.sort_values(
+            sort_col, ascending=plan.direction == "ascending"
+        ), [
+            "sku", "receipt_count",
             "lead_time_mean", "lead_time_median", "lead_time_std", "lead_time_cv",
             "lead_time_min", "lead_time_max", "lead_time_outlier_count",
         ]).head(limit)
+        definitions["lead_time_variability"] = "sample standard deviation of actual lead-time days"
         facts["receipt_ranking"] = _records(table)
     elif plan.intent == "cross_file_risk":
         rows = _filter_view(model.sku_view, plan)
-        table, cross_definitions = _cross_file_ranking(rows, question, limit)
+        table, cross_definitions = _cross_file_ranking(rows, plan, limit)
         definitions.update(cross_definitions)
         facts["cross_file_result"] = _records(table)
     elif plan.intent == "inventory_ranking":
         rows = _filter_view(model.sku_view, plan)
-        sort_col = "rop_gap" if "rop" in q or "reorder" in q else "safety_stock_gap"
-        ascending = bool(re.search(r"decreas|excess|reduce|lower", q))
+        sort_col = "rop_gap" if plan.metric == "rop_gap" else "safety_stock_gap"
+        if "positive_safety_stock_gap" in plan.conditions:
+            rows = rows.loc[rows["safety_stock_gap"] > 0]
+        if "positive_rop_gap" in plan.conditions:
+            rows = rows.loc[rows["rop_gap"] > 0]
+        ascending = plan.direction == "ascending"
         table = _columns(rows.sort_values(sort_col, ascending=ascending), [
             "sku", "description", "supplier", "item_class", "demand_cv", "lead_time_cv",
             "current_safety_stock", "recommended_safety_stock", "safety_stock_gap",
@@ -895,6 +1084,13 @@ def _build_evidence(
         limitations.append("No rows matched the requested filters.")
     debug = {
         "intent": plan.intent,
+        "query_type": plan.query_type,
+        "entity_type": plan.entity_type,
+        "metric": plan.metric,
+        "direction": plan.direction,
+        "limit": plan.limit,
+        "conditions": plan.conditions,
+        "confidence": plan.confidence,
         "entities": {"skus": plan.skus, "suppliers": plan.suppliers},
         "sources_used": plan.required_sources,
         "operations": plan.operations,
@@ -911,12 +1107,13 @@ def build_analytical_context(
     analysis_results: Sequence[Mapping[str, Any]] | pd.DataFrame,
     prior_metadata: Mapping[str, Any] | None = None,
     data_model: InventoryDataModel | None = None,
+    interpretation_override: LanguageInterpretation | None = None,
 ) -> tuple[str, pd.DataFrame | None, dict[str, Any], str | None]:
     """Plan, execute, and serialize one question-specific evidence package."""
     model = data_model or InventoryDataModel.build(
         item_master, demand_history, receipt_history, analysis_results
     )
-    plan = plan_question(question, model.item_master, prior_metadata)
+    plan = plan_question(question, model.item_master, prior_metadata, interpretation_override)
     facts, table, direct_answer, limitations, extra = _build_evidence(question, plan, model)
     focus_sku = str(table.iloc[0]["sku"]) if table is not None and not table.empty and "sku" in table else (
         plan.skus[0] if plan.skus else None
@@ -975,6 +1172,47 @@ def _safe_api_error(exc: Exception) -> InventoryAssistantError:
     return InventoryAssistantError(detail)
 
 
+def _interpret_with_nemotron(
+    question: str,
+    *,
+    client: Any,
+    model: str,
+) -> LanguageInterpretation | None:
+    """Request a constrained plan only when deterministic confidence is low."""
+    schema_prompt = """Interpret one inventory question. Return JSON only; no prose.
+Allowed query_type: ranking, comparison, filter, metric_lookup, time_series,
+explanation, forecast, profile, clarification.
+Allowed entity_type: sku, supplier.
+Allowed metric: lead_time_variability, lead_time_mean, demand_variability,
+demand_level, demand_trend, safety_stock_gap, rop_gap, stockout_risk, or null.
+Allowed direction: ascending, descending, or null.
+Allowed conditions: high_demand_variability, high_lead_time_variability,
+increasing_demand, stable_demand, stable_lead_time, long_lead_time,
+positive_safety_stock_gap, positive_rop_gap, low_current_safety_stock.
+Use keys: query_type, entity_type, metric, metrics, direction, limit, conditions.
+Do not calculate values, name results, write code, or add fields."""
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": schema_prompt},
+                {"role": "user", "content": question[:1000]},
+            ],
+            temperature=0,
+            max_tokens=250,
+        )
+        content = str(response.choices[0].message.content or "").strip()
+        match = re.search(r"\{.*\}", content, re.S)
+        if not match:
+            return None
+        payload = json.loads(match.group(0))
+        return validate_interpretation_payload(payload, maximum_rows=MAX_CONTEXT_ROWS)
+    except Exception:
+        # Parsing is an optional fallback. A failed/invalid interpretation is
+        # safer as a clarification than as a forced analytical operation.
+        return None
+
+
 def ask_inventory_assistant(
     question: str,
     item_master: pd.DataFrame,
@@ -991,10 +1229,26 @@ def ask_inventory_assistant(
 ) -> AssistantAnswer:
     if not question or not question.strip():
         raise ValueError("Enter a question about the completed inventory analysis.")
+    config: dict[str, str] | None = None
+    interpretation_override: LanguageInterpretation | None = None
+    preliminary_plan = plan_question(question, item_master, prior_metadata)
+    if preliminary_plan.intent == "clarification" and not preliminary_plan.ambiguous_entities:
+        try:
+            config = get_nvidia_config(api_key, model, base_url)
+            if client is None:
+                from openai import OpenAI
+                client = OpenAI(
+                    base_url=config["base_url"], api_key=config["api_key"], timeout=30.0, max_retries=1
+                )
+            interpretation_override = _interpret_with_nemotron(
+                question, client=client, model=config["model"]
+            )
+        except (MissingNvidiaAPIKey, ImportError):
+            interpretation_override = None
     try:
         context, table, metadata, direct_answer = build_analytical_context(
             question, item_master, demand_history, receipt_history, analysis_results,
-            prior_metadata, data_model,
+            prior_metadata, data_model, interpretation_override,
         )
     except InventoryDataError as exc:
         raise InventoryAssistantError(str(exc)) from exc
@@ -1002,7 +1256,7 @@ def ask_inventory_assistant(
     if direct_answer:
         return AssistantAnswer(direct_answer, table, metadata, evidence)
 
-    config = get_nvidia_config(api_key, model, base_url)
+    config = config or get_nvidia_config(api_key, model, base_url)
     if client is None:
         try:
             from openai import OpenAI

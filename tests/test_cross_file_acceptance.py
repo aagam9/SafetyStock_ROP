@@ -141,6 +141,54 @@ class CrossFileAcceptanceTests(unittest.TestCase):
         self.assertIn("under_protected_a_share", table.columns)
         self.assertTrue(table["under_protected_a_share"].is_monotonic_decreasing)
 
+    def test_normal_language_lead_time_variability_ranking(self):
+        _, table, metadata, direct = self.context(
+            "Which SKU is having the most Lead time variability?"
+        )
+        expected = self.model.receipt_summary.sort_values(
+            "lead_time_std", ascending=False
+        ).iloc[0]
+        self.assertIsNone(direct)
+        self.assertEqual(metadata["intent"], "receipt_ranking")
+        self.assertEqual(metadata["evidence"]["question_plan"]["query_type"], "ranking")
+        self.assertEqual(metadata["evidence"]["question_plan"]["metric"], "lead_time_variability")
+        self.assertEqual(metadata["sources_used"], ["receipt_history"])
+        self.assertEqual(len(table), 1)
+        self.assertEqual(table.iloc[0]["sku"], expected["sku"])
+        self.assertEqual(table.iloc[0]["lead_time_std"], expected["lead_time_std"])
+
+    def test_ranked_sku_follow_up_pronouns_requery_data(self):
+        _, first_table, first_metadata, _ = self.context(
+            "Which SKU has the highest lead-time variability?"
+        )
+        focus_sku = first_table.iloc[0]["sku"]
+        _, supplier_table, supplier_metadata, _ = build_analytical_context(
+            "What supplier is it from?",
+            self.result["item_master"], self.result["demand_history"],
+            self.result["receipt_history"], self.result["analysis_results"],
+            prior_metadata=first_metadata, data_model=self.model,
+        )
+        self.assertEqual(supplier_metadata["intent"], "supplier_lookup")
+        self.assertEqual(supplier_table.iloc[0]["sku"], focus_sku)
+
+        _, demand_table, demand_metadata, _ = build_analytical_context(
+            "What about its demand?",
+            self.result["item_master"], self.result["demand_history"],
+            self.result["receipt_history"], self.result["analysis_results"],
+            prior_metadata=supplier_metadata, data_model=self.model,
+        )
+        self.assertEqual(demand_metadata["intent"], "sku_demand")
+        self.assertTrue((demand_table["sku"] == focus_sku).all())
+
+        _, risk_table, risk_metadata, _ = build_analytical_context(
+            "Why is it risky?",
+            self.result["item_master"], self.result["demand_history"],
+            self.result["receipt_history"], self.result["analysis_results"],
+            prior_metadata=demand_metadata, data_model=self.model,
+        )
+        self.assertEqual(risk_metadata["intent"], "stockout_risk")
+        self.assertEqual(risk_table.iloc[0]["sku"], focus_sku)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -195,6 +195,20 @@ Each question creates a source plan before calculations run. Examples:
 - supplier/cross-domain rankings: independently aggregated SKU metrics combined
   at SKU grain
 
+Natural-language interpretation is separated from calculation. The parser first
+matches SKU, description, and supplier values against the current `item_master`,
+then normalizes business phrasing such as “most inconsistent lead times,” “top
+five by demand volatility,” and “largest Safety Stock gap” into a constrained
+plan containing entity type, metric, direction, limit, filters, and approved
+operations. The word after `SKU` is never assumed to be an identifier; an
+unknown-SKU response requires identifier-shaped evidence and validation against
+the uploaded SKU dictionary. Ambiguous known names produce a clarification.
+
+For phrasing that the deterministic interpreter cannot classify confidently,
+Nemotron may return a small JSON interpretation using an allow-listed schema.
+That response is validated before use and cannot supply column names, executable
+code, or numerical results. Python remains authoritative for every calculation.
+
 Nemotron receives only the resulting question-specific evidence. Answers include
 a compact **Based on** section, and the Streamlit **View data used for this
 answer** expander shows sources, filters, approved Python operations, metric
@@ -243,5 +257,6 @@ Coverage includes supplier validation/joining, one-row-per-SKU demand and receip
 aggregation, many-to-many inflation prevention, source selection, raw-history
 authority, missing-history behavior, supplier relationships, deterministic
 forecasts, Safety Stock/ROP rankings, Stockout Risk, unsupported-data responses,
-context construction, cache/session reset, missing NVIDIA configuration, and a
-mocked Nemotron call.
+natural-language ranking/filter/comparison variants, evidence-based entity
+resolution, conversational pronouns, context construction, cache/session reset,
+missing NVIDIA configuration, and mocked Nemotron interpretation/explanation.

@@ -39,6 +39,24 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=FakeCompletions())
 
 
+class SequentialCompletions:
+    def __init__(self, contents):
+        self.contents = list(contents)
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        content = self.contents.pop(0)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+
+class SequentialClient:
+    def __init__(self, contents):
+        self.chat = SimpleNamespace(completions=SequentialCompletions(contents))
+
+
 class InventoryAssistantTests(unittest.TestCase):
     def setUp(self):
         self.items = pd.DataFrame(
@@ -167,6 +185,23 @@ class InventoryAssistantTests(unittest.TestCase):
             ["item_master", "demand_history", "receipt_history", "analysis_results"],
         )
         self.assertIn("Based on:", answer.text)
+
+    def test_low_confidence_language_uses_validated_nemotron_plan(self):
+        client = SequentialClient([
+            '{"query_type":"ranking","entity_type":"sku",'
+            '"metric":"stockout_risk","metrics":["stockout_risk"],'
+            '"direction":"descending","limit":1,"conditions":[]}',
+            "SKU A has the highest relative inventory risk.",
+        ])
+        answer = ask_inventory_assistant(
+            "Show me the item with the greatest planning exposure.",
+            self.items, self.demand, self.receipts, self.results,
+            api_key="test-key", client=client,
+        )
+        self.assertEqual(answer.metadata["intent"], "stockout_risk")
+        self.assertEqual(answer.metadata["evidence"]["question_plan"]["metric"], "stockout_risk")
+        self.assertEqual(len(answer.table), 1)
+        self.assertEqual(len(client.chat.completions.requests), 2)
 
     def test_source_selection_uses_the_minimum_authoritative_datasets(self):
         supplier = plan_question("What supplier provides SKU A?", self.items)
