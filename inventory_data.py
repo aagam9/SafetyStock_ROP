@@ -41,7 +41,7 @@ def _records(frame: pd.DataFrame, limit: int | None = None) -> list[dict[str, An
 def _safe_pct_change(current: float, previous: float) -> float | None:
     if pd.isna(previous) or previous == 0:
         return None
-    return round((current - previous) / previous * 100, 2)
+    return (current - previous) / previous * 100
 
 
 def _trend_label(recent: float, previous: float, change_pct: float | None) -> str:
@@ -72,7 +72,7 @@ def _prepare_demand_history(demand_history: pd.DataFrame) -> tuple[pd.DataFrame,
         frame["_period_sort"] = numeric_period
         period_kind = "numeric_week"
     else:
-        date_period = pd.to_datetime(frame["week"], errors="coerce")
+        date_period = pd.to_datetime(frame["week"], errors="coerce", format="mixed")
         if date_period.notna().all():
             frame["_period_sort"] = date_period
             period_kind = "date"
@@ -96,7 +96,7 @@ def aggregate_demand_history(
         previous_start = max(previous_end - recent_window, 0)
         previous = values[previous_start:previous_end]
         mean = float(values.mean()) if len(values) else np.nan
-        std = float(values.std(ddof=1)) if len(values) > 1 else 0.0 if len(values) else np.nan
+        std = float(values.std(ddof=1)) if len(values) > 1 else np.nan
         recent_avg = float(recent.mean()) if len(recent) else np.nan
         previous_avg = float(previous.mean()) if len(previous) else np.nan
         change_pct = _safe_pct_change(recent_avg, previous_avg)
@@ -104,17 +104,17 @@ def aggregate_demand_history(
             {
                 "sku": sku,
                 "demand_history_points": int(len(values)),
-                "demand_total": round(float(values.sum()), 2) if len(values) else np.nan,
-                "demand_mean": round(mean, 2) if pd.notna(mean) else np.nan,
-                "demand_median": round(float(np.median(values)), 2) if len(values) else np.nan,
-                "demand_std": round(std, 2) if pd.notna(std) else np.nan,
-                "demand_cv": round(std / mean, 4) if pd.notna(mean) and mean != 0 else np.nan,
+                "demand_total": float(values.sum()) if len(values) else np.nan,
+                "demand_mean": mean if pd.notna(mean) else np.nan,
+                "demand_median": float(np.median(values)) if len(values) else np.nan,
+                "demand_std": std if pd.notna(std) else np.nan,
+                "demand_cv": std / mean if pd.notna(mean) and mean != 0 else np.nan,
                 "demand_zero_periods": int((values == 0).sum()),
-                "demand_zero_share": round(float((values == 0).mean()), 4) if len(values) else np.nan,
+                "demand_zero_share": float((values == 0).mean()) if len(values) else np.nan,
                 "demand_recent_window": int(len(recent)),
-                "demand_recent_avg": round(recent_avg, 2) if pd.notna(recent_avg) else np.nan,
+                "demand_recent_avg": recent_avg if pd.notna(recent_avg) else np.nan,
                 "demand_previous_window": int(len(previous)),
-                "demand_previous_avg": round(previous_avg, 2) if pd.notna(previous_avg) else np.nan,
+                "demand_previous_avg": previous_avg if pd.notna(previous_avg) else np.nan,
                 "demand_change_pct": change_pct,
                 "demand_trend": _trend_label(recent_avg, previous_avg, change_pct),
             }
@@ -143,7 +143,7 @@ def aggregate_receipt_history(receipt_history: pd.DataFrame) -> pd.DataFrame:
     for sku, group in frame.groupby("sku", sort=False):
         values = group["actual_lead_time_days"].dropna().to_numpy(dtype=float)
         mean = float(values.mean()) if len(values) else np.nan
-        std = float(values.std(ddof=1)) if len(values) > 1 else 0.0 if len(values) else np.nan
+        std = float(values.std(ddof=1)) if len(values) > 1 else np.nan
         if len(values) >= 4:
             q1, q3 = np.percentile(values, [25, 75])
             upper = q3 + 1.5 * (q3 - q1)
@@ -154,12 +154,12 @@ def aggregate_receipt_history(receipt_history: pd.DataFrame) -> pd.DataFrame:
             {
                 "sku": sku,
                 "receipt_count": int(len(values)),
-                "lead_time_mean": round(mean, 2) if pd.notna(mean) else np.nan,
-                "lead_time_median": round(float(np.median(values)), 2) if len(values) else np.nan,
-                "lead_time_std": round(std, 2) if pd.notna(std) else np.nan,
-                "lead_time_cv": round(std / mean, 4) if pd.notna(mean) and mean != 0 else np.nan,
-                "lead_time_min": round(float(values.min()), 2) if len(values) else np.nan,
-                "lead_time_max": round(float(values.max()), 2) if len(values) else np.nan,
+                "lead_time_mean": mean if pd.notna(mean) else np.nan,
+                "lead_time_median": float(np.median(values)) if len(values) else np.nan,
+                "lead_time_std": std if pd.notna(std) else np.nan,
+                "lead_time_cv": std / mean if pd.notna(mean) and mean != 0 else np.nan,
+                "lead_time_min": float(values.min()) if len(values) else np.nan,
+                "lead_time_max": float(values.max()) if len(values) else np.nan,
                 "lead_time_outlier_count": outlier_count,
                 "receipt_chronology_available": False,
             }
@@ -302,6 +302,11 @@ class InventoryDataModel:
         view = _add_relationship_risk(view)
 
         prepared_receipts = receipt_history.copy()
+        if "receipt_row_id" not in prepared_receipts.columns:
+            prepared_receipts = prepared_receipts.reset_index(drop=True)
+            prepared_receipts["receipt_row_id"] = [
+                f"receipt-{index + 1}" for index in range(len(prepared_receipts))
+            ]
         prepared_receipts["sku"] = prepared_receipts["sku"].astype(str).str.strip()
         prepared_receipts["actual_lead_time_days"] = pd.to_numeric(
             prepared_receipts["actual_lead_time_days"], errors="coerce"

@@ -35,7 +35,7 @@ SESSION_ANALYSIS_KEYS = (
     "last_report", "last_summary", "item_master", "demand_history",
     "receipt_history", "analysis_results", "review_queue", "analysis_summary",
     "inventory_chat", "assistant_metadata", "assistant_data_model",
-    "last_input_signature",
+    "assistant_validation_warnings", "last_input_signature",
 )
 
 SYSTEM_PROMPT = """You are an inventory analytics assistant. Use only the explicit

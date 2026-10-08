@@ -15,11 +15,15 @@ from safety_stock_agent import BASE_DIR, SafetyStockInputError, run_analysis
 from inventory_assistant import (
     InventoryAssistantError,
     MissingNvidiaAPIKey,
-    ask_inventory_assistant,
     get_nvidia_config,
     reset_inventory_session,
 )
+from inventory_contracts import validate_inventory_frames
 from inventory_data import InventoryDataModel
+from verified_inventory_assistant import (
+    PlanningError,
+    ask_verified_inventory_assistant,
+)
 
 
 APP_TITLE = "Safety Stock / ROP Drift Review"
@@ -64,7 +68,7 @@ FILE_GUIDE = pd.DataFrame(
         },
         {
             "Exact filename": "receipt_history.csv",
-            "One row per": "Received purchase order",
+            "One row per": "Receipt observation (a PO may repeat for partial receipts)",
             "Required columns": "sku, po_number, actual_lead_time_days",
         },
     ]
@@ -157,12 +161,16 @@ def _save_run_result(result: dict, input_signature: str):
     st.session_state["demand_history"] = result["demand_history"]
     st.session_state["receipt_history"] = result["receipt_history"]
     st.session_state["analysis_results"] = result["analysis_results"]
+    validated, validation_report = validate_inventory_frames(
+        result["item_master"], result["demand_history"], result["receipt_history"]
+    )
     st.session_state["assistant_data_model"] = InventoryDataModel.build(
-        result["item_master"],
-        result["demand_history"],
-        result["receipt_history"],
+        validated["item_master"],
+        validated["demand_history"],
+        validated["receipt_history"],
         result["analysis_results"],
     )
+    st.session_state["assistant_validation_warnings"] = validation_report.warnings
     st.session_state["review_queue"] = result["review_queue"]
     st.session_state["inventory_chat"] = []
     st.session_state["assistant_metadata"] = {}
@@ -174,9 +182,34 @@ def _render_answer_evidence(evidence: dict | None):
     if not evidence:
         return
     with st.expander("View data used for this answer"):
-        sources = evidence.get("data_sources_used", [])
+        response_paths = evidence.get("response_paths", [])
+        if response_paths:
+            st.markdown("**Response path:** " + ", ".join(response_paths))
+        knowledge_topics = evidence.get("knowledge_topics", [])
+        if knowledge_topics:
+            st.markdown(
+                "**Inventory knowledge topics:** "
+                + ", ".join(topic.replace("_", " ") for topic in knowledge_topics)
+            )
+        sources = evidence.get("source_tables", evidence.get("data_sources_used", []))
         if sources:
             st.markdown("**Sources used:** " + ", ".join(f"`{source}`" for source in sources))
+        if evidence.get("result_id"):
+            st.caption(
+                f"Result: {evidence['result_id']} · Dataset: "
+                f"{str(evidence.get('dataset_fingerprint', ''))[:12]}"
+            )
+        if evidence.get("metric_definition"):
+            st.markdown("**Metric definition**")
+            st.write(evidence["metric_definition"])
+        coverage = evidence.get("coverage", {})
+        if coverage:
+            st.markdown("**Coverage**")
+            st.json(coverage)
+        interval = evidence.get("date_interval")
+        if interval:
+            st.markdown("**Period interval**")
+            st.json(interval)
         plan = evidence.get("question_plan", {})
         if plan:
             st.markdown("**Parsed question plan**")
@@ -200,7 +233,7 @@ def _render_answer_evidence(evidence: dict | None):
         if definitions:
             st.markdown("**Metric definitions**")
             st.json(definitions)
-        limitations = evidence.get("limitations", [])
+        limitations = evidence.get("limitations", []) + evidence.get("warnings", [])
         if limitations:
             st.markdown("**Limitations**")
             for limitation in limitations:
@@ -210,6 +243,23 @@ def _render_answer_evidence(evidence: dict | None):
             st.caption(
                 f"Intent: {debug.get('intent', 'unknown')} · "
                 f"Rows sent to the explanation layer: {debug.get('rows_sent_to_llm', 0)}"
+            )
+        source_rows = evidence.get("source_rows", [])
+        if source_rows:
+            st.markdown("**Source rows**")
+            st.dataframe(pd.DataFrame(source_rows), hide_index=True, width="stretch")
+        plan_details = evidence.get("plan")
+        if plan_details:
+            st.markdown("**Validated analytical plan**")
+            st.json(plan_details)
+        if evidence.get("query"):
+            st.markdown("**Executed read-only query**")
+            st.code(evidence["query"], language="sql")
+        if evidence.get("tie_handling"):
+            st.caption(
+                f"Tie handling: {evidence['tie_handling']} · "
+                f"Calculation complete: {evidence.get('calculation_complete', True)} · "
+                f"Display truncated: {evidence.get('display_truncated', False)}"
             )
 
 
@@ -262,9 +312,9 @@ def _render_inventory_assistant():
         return
 
     st.caption(
-        "Ask about demand, forecasts, Safety Stock, Reorder Point, Stockout Risk, "
-        "receipt lead times, or supplier lead-time behavior. Numerical analysis is "
-        "performed in Python; NVIDIA Nemotron explains the grounded results."
+        "NVIDIA Nemotron plans a bounded analytical request; deterministic tools calculate "
+        "the values over the current dataset. It can also explain inventory concepts and "
+        "offer clearly labeled recommendations from verified context."
     )
     chat = st.session_state.setdefault("inventory_chat", [])
     for message in chat:
@@ -278,25 +328,25 @@ def _render_inventory_assistant():
     question = st.chat_input("Ask a question about this completed analysis")
     if not question:
         return
-    previous_history = [{"role": m["role"], "content": m["content"]} for m in chat]
     chat.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
     with st.chat_message("assistant"):
         try:
             with st.spinner("Calculating evidence and asking NVIDIA Nemotron…"):
-                answer = ask_inventory_assistant(
+                config = get_nvidia_config(api_key=api_key, model=model, base_url=base_url)
+                from openai import OpenAI
+                client = OpenAI(
+                    base_url=config["base_url"], api_key=config["api_key"],
+                    timeout=30.0, max_retries=1,
+                )
+                answer = ask_verified_inventory_assistant(
                     question=question,
-                    item_master=st.session_state["item_master"],
-                    demand_history=st.session_state["demand_history"],
-                    receipt_history=st.session_state["receipt_history"],
-                    analysis_results=st.session_state["analysis_results"],
-                    chat_history=previous_history,
-                    prior_metadata=st.session_state.get("assistant_metadata"),
-                    api_key=api_key,
-                    model=model,
-                    base_url=base_url,
                     data_model=st.session_state.get("assistant_data_model"),
+                    client=client,
+                    model=config["model"],
+                    prior_context=st.session_state.get("assistant_metadata"),
+                    validation_warnings=st.session_state.get("assistant_validation_warnings", []),
                 )
             st.markdown(answer.text)
             if answer.table is not None and not answer.table.empty:
@@ -310,7 +360,7 @@ def _render_inventory_assistant():
             })
             st.session_state["assistant_metadata"] = answer.metadata
             st.session_state["inventory_chat"] = chat[-12:]
-        except InventoryAssistantError as exc:
+        except (InventoryAssistantError, PlanningError) as exc:
             st.error(str(exc))
             chat.append({"role": "assistant", "content": str(exc)})
             st.session_state["inventory_chat"] = chat[-12:]
@@ -356,8 +406,9 @@ with st.expander("Input rules, file structure, and sample files", expanded=True)
 - Upload exactly one file for each data set below. CSV files must include a header row.
 - Keep SKU values consistent across all three files, including capitalization and
   leading zeros. Every item-master SKU should have demand and receipt history.
-- Use one item-master row per SKU, one demand row per SKU/week, and one receipt row per
-  received purchase order. Numeric columns must contain numbers only—no `$`, `%`, or
+- Use one item-master row per SKU, one demand row per SKU/week, and one row per
+  receipt observation. A PO may repeat for partial receipts; it is not silently
+  collapsed to a PO-level statistic. Numeric columns must contain numbers only—no `$`, `%`, or
   comma formatting.
 - `item_class` should be `A`, `B`, or `C`; lead times are calendar days; demand and stock
   quantities use the item's planning unit; `unit_cost` uses one consistent currency.

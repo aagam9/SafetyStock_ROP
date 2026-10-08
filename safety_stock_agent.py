@@ -26,6 +26,8 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from anthropic import Anthropic
 
+from inventory_contracts import DataContractError, validate_inventory_frames
+
 # ── Secrets ────────────────────────────────────────────────────────────────
 # settings.json next to this script: {"ANTHROPIC_API_KEY": "..."}
 # or: export ANTHROPIC_API_KEY="..."
@@ -362,57 +364,19 @@ def _load_input_data(data_dir: Path):
         frame["sku"] = frame["sku"].astype(str).str.strip()
         frames[filename] = frame
 
-    items = frames["item_master.csv"]
-    demand = frames["demand_history.csv"]
-    receipts = frames["receipt_history.csv"]
-
-    if items["supplier"].isna().any() or items["supplier"].astype(str).str.strip().eq("").any():
-        raise SafetyStockInputError("item_master.csv contains a missing or blank supplier.")
-    items["supplier"] = items["supplier"].astype(str).str.strip()
-    if items[list(_NUMERIC_COLUMNS["item_master.csv"])].isna().any().any():
-        raise SafetyStockInputError("item_master.csv contains a null numeric calculation value.")
-    if items["sku"].duplicated().any():
-        duplicates = sorted(items.loc[items["sku"].duplicated(False), "sku"].unique())
-        raise SafetyStockInputError(
-            "item_master.csv must contain one row per SKU. Duplicate SKU(s): "
-            + ", ".join(duplicates[:10])
+    try:
+        validated, _ = validate_inventory_frames(
+            frames["item_master.csv"],
+            frames["demand_history.csv"],
+            frames["receipt_history.csv"],
         )
-    if demand[["sku", "week"]].duplicated().any():
-        raise SafetyStockInputError("demand_history.csv contains duplicate SKU/week rows.")
-    if receipts["po_number"].isna().any() or receipts["po_number"].astype(str).str.strip().eq("").any():
-        raise SafetyStockInputError("receipt_history.csv contains a missing or blank po_number.")
-    if receipts["po_number"].astype(str).duplicated().any():
-        raise SafetyStockInputError("receipt_history.csv contains duplicate po_number values.")
-    if demand["demand_qty"].isna().any() or (demand["demand_qty"] < 0).any():
-        raise SafetyStockInputError("demand_history.csv demand_qty must be non-null and nonnegative.")
-    if receipts["actual_lead_time_days"].isna().any() or (receipts["actual_lead_time_days"] <= 0).any():
-        raise SafetyStockInputError(
-            "receipt_history.csv actual_lead_time_days must be non-null and positive."
-        )
-    week_text = demand["week"].astype(str).str.strip()
-    numeric_week = pd.to_numeric(week_text, errors="coerce")
-    if numeric_week.isna().any():
-        date_week = pd.to_datetime(week_text, errors="coerce")
-        if date_week.isna().any():
-            raise SafetyStockInputError(
-                "demand_history.csv column 'week' must contain valid week numbers or dates."
-            )
-
-    master_skus = set(items["sku"])
-    for filename, frame in (("demand_history.csv", demand), ("receipt_history.csv", receipts)):
-        unknown = sorted(set(frame["sku"]) - master_skus)
-        missing_history = sorted(master_skus - set(frame["sku"]))
-        if unknown:
-            raise SafetyStockInputError(
-                f"{filename} contains SKU(s) absent from item_master.csv: " + ", ".join(unknown[:10])
-            )
-        if missing_history:
-            raise SafetyStockInputError(
-                f"{filename} has no history for item-master SKU(s): "
-                + ", ".join(missing_history[:10])
-            )
-
-    return items, demand, receipts
+    except DataContractError as exc:
+        raise SafetyStockInputError(str(exc)) from exc
+    return (
+        validated["item_master"],
+        validated["demand_history"],
+        validated["receipt_history"],
+    )
 
 
 def run_analysis(data_dir: str | Path = BASE_DIR, api_key: str | None = None,

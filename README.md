@@ -1,13 +1,13 @@
 # Safety Stock / ROP Drift Review
 
 A Streamlit inventory-planning application that recalculates Safety Stock and
-Reorder Point (ROP), produces an Excel review queue, and enables grounded
-questions about the completed analysis through NVIDIA Nemotron.
+Reorder Point (ROP), produces an Excel review queue, and answers natural-language
+questions through a validated analytical interface.
 
-The existing calculation engine remains authoritative. Python performs all
-filtering, joins, aggregation, forecasting, gap ranking, and Stockout Risk
-scoring. Nemotron receives a small question-specific evidence packet and
-explains the results; it is not used as a database or calculation engine.
+The existing calculation engine remains authoritative. NVIDIA Nemotron plans an
+allow-listed request; Python/DuckDB calculates the answer over the current data.
+Critical identifiers and values are rendered from typed evidence rather than
+model prose.
 
 ## Run locally
 
@@ -16,247 +16,211 @@ python -m pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-The command-line analysis remains available:
+The command-line workbook workflow remains available:
 
 ```bash
 python safety_stock_agent.py
 ```
 
-The web workflow is:
+In the web app, upload the three CSVs (or choose the bundled sample), run the
+analysis, review/download the workbook, then use **Ask Your Inventory Data** if
+NVIDIA is configured. A changed upload or new run clears chat and structured
+references so evidence cannot cross datasets.
 
-1. Upload the three CSV files or choose the bundled sample data.
-2. Select **Run analysis**.
-3. Review the run summary and download `safety_stock_review.xlsx`.
-4. If NVIDIA is configured, use **Ask Your Inventory Data** for grounded
-   questions and follow-ups.
+## Input contracts
 
-New uploads or a newly run analysis clear the prior assistant conversation so
-results from different data sets cannot be mixed.
-
-## Input files
-
-CSV headers are case-sensitive. Keep SKU identifiers consistent, including
-capitalization and leading zeros.
+Headers are case-sensitive. SKU values must be consistent, including leading
+zeros and capitalization.
 
 ### `item_master.csv`
 
-One row per SKU.
+Grain: one row per SKU.
 
 | Column | Meaning |
 | --- | --- |
-| `sku` | Nonblank unique SKU identifier |
+| `sku` | Nonblank unique item identifier |
 | `description` | Item description |
-| `supplier` | Primary/current supplier for this SKU |
-| `item_class` | ABC class (`A`, `B`, or `C`) |
+| `supplier` | Current primary supplier mapping |
+| `item_class` | Uploaded ABC class (`A`, `B`, or `C`) |
 | `assumed_lead_time_days` | Current planning lead time in calendar days |
-| `current_safety_stock` | Current Safety Stock setting |
-| `current_rop` | Current ROP setting |
-| `unit_cost` | Unit cost in one consistent currency |
+| `current_safety_stock` | Current Safety Stock quantity |
+| `current_rop` | Current ROP quantity |
+| `unit_cost` | Positive unit cost in one consistent currency |
 
-This version assumes one primary supplier per SKU. It does not implement
-multi-sourcing.
+The app does not recompute ABC class and does not assume multi-sourcing.
 
 ### `demand_history.csv`
 
-One row per SKU/week.
+Grain: one row per SKU/week or period.
 
 | Column | Meaning |
 | --- | --- |
-| `sku` | Item identifier present in `item_master.csv` |
-| `week` | Week number or valid date; unique within the SKU |
-| `demand_qty` | Nonnegative demand quantity |
+| `sku` | Item identifier in `item_master.csv` |
+| `week` | Consistently numeric period or parseable date, unique within SKU |
+| `demand_qty` | Nonnegative period demand |
 
-Keep rows in oldest-to-newest order within each SKU. The calculation engine
-uses the most recent 26 rows as its recent-demand window.
+The SS/ROP calculation uses the most recent 26 rows. Analytical windows sort a
+numeric/date `week` field and expose the actual period interval used.
 
 ### `receipt_history.csv`
 
-One row per received purchase order.
+Grain: one receipt observation. A PO may have multiple rows for partial receipts;
+the source has no receipt-line identifier or quantity.
 
 | Column | Meaning |
 | --- | --- |
-| `sku` | Item identifier present in `item_master.csv` |
-| `po_number` | Nonblank unique receipt/PO identifier |
-| `actual_lead_time_days` | Positive actual receipt lead time in calendar days |
+| `sku` | Item identifier in `item_master.csv` |
+| `po_number` | Nonblank source PO identifier; may repeat |
+| `actual_lead_time_days` | Positive observed lead time in calendar days |
 
-Supplier is joined from `item_master.csv`; it is not required in receipt
-history for this single-sourcing version.
+Repeated SKU/PO rows are retained and disclosed. Exact duplicate
+SKU/PO/lead-time rows are rejected because the current fields cannot distinguish
+them from accidental duplication. The app does not invent a PO-level lead-time
+aggregation convention.
 
-Validation rejects missing columns, blank SKU/supplier values, duplicate item
-SKUs, duplicate SKU/week rows, duplicate PO numbers, invalid numeric values,
-malformed week values, negative demand, nonpositive lead time, unknown SKUs,
-and item-master SKUs without demand or receipt history.
+Validation also rejects missing fields, blank identifiers, duplicate item SKUs,
+duplicate SKU/week rows, invalid numeric values, inconsistent period formats,
+negative demand, nonpositive lead times, unknown SKUs, and missing histories.
 
-## Existing Safety Stock and ROP analysis
+## Safety Stock and ROP calculations
 
-For each SKU, the engine calculates recent weekly demand mean and variability,
-demand trend, intermittency, demand outliers, actual lead-time mean and
-variability, recommended Safety Stock, and recommended ROP. ABC classes select
-the existing service-level Z-scores. The formulas and thresholds are documented
-in `CALCULATION_METHODOLOGY.txt`.
+`safety_stock_agent.analyze_sku` remains the authoritative engine. It uses:
 
-Only flagged SKUs enter the review queue. The legacy review step can optionally
-use Claude through `ANTHROPIC_API_KEY`; without that key, the existing
-transparent rule-based review still runs. This is separate from the new
-Nemotron conversational assistant.
+- the latest 26 demand rows, converted from weekly to daily values;
+- sample demand and lead-time standard deviations (`ddof=1`);
+- receipt lead times in calendar days;
+- combined demand and lead-time variance;
+- uploaded ABC classes with z-values A=2.05, B=1.65, and C=1.28;
+- `ROP = mean lead-time demand + Safety Stock`.
 
-The workbook contains:
+The formulas, drift thresholds, trend/outlier rules, and workbook fields are in
+`CALCULATION_METHODOLOGY.txt`. Without `ANTHROPIC_API_KEY`, the workbook's
+existing transparent rule-based review still runs.
 
-- **Review Queue**: flagged SKUs, supplier, current/recommended settings,
-  drift, dollar impact, action, confidence, risk, and rationale.
-- **Portfolio Scan**: every SKU with supplier, demand/lead-time statistics,
-  current/recommended Safety Stock and ROP, and review flags.
+## NVIDIA setup and capability decision
 
-## NVIDIA Nemotron setup
-
-The assistant calls NVIDIA's OpenAI-compatible hosted endpoint with the
-`openai` Python client. No credential is stored in source or generated reports.
-
-Required:
+The assistant uses the existing OpenAI-compatible NVIDIA endpoint. Secrets are
+not logged or written to reports.
 
 ```text
 NVIDIA_API_KEY=your_api_key_here
-```
-
-Optional overrides:
-
-```text
 NVIDIA_MODEL=nvidia/nemotron-3-super-120b-a12b
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 ```
 
-The model and endpoint are centralized in `inventory_assistant.py`. Set the
-variables in the environment before starting Streamlit, or copy `.env.example`
-to `.env` and enter the local values. The assistant reads this local `.env`
-directly; process environment variables and Streamlit secrets take precedence.
+Only `NVIDIA_API_KEY` is required. Environment variables and Streamlit secrets
+take precedence over a local ignored `.env` file. Do not commit `.env`,
+`settings.json`, or `.streamlit/secrets.toml`.
 
-For Streamlit deployment, the equivalent `.streamlit/secrets.toml` is:
+The repository does not establish reliable native tool calling or
+provider-enforced structured outputs for the configured endpoint. The assistant
+therefore uses JSON planning with schema validation and one repair attempt. It
+sends the schema, data dictionary, entity catalog, and bounded structured
+conversation context—not bulk source rows—to the planning model.
 
-```toml
-NVIDIA_API_KEY = "your-key-here"
-NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-```
+## Verified question flow
 
-Obtain an API key from the NVIDIA API catalog/account used by your
-organization. Do not commit `.env`, `settings.json`, or
-`.streamlit/secrets.toml`; these paths are ignored by Git.
+1. Validate/normalize source frames and compute a dataset fingerprint.
+2. Ask the model for a semantic JSON plan selecting one or more response paths:
+   `analysis`, `knowledge`, and `recommendation`.
+3. Validate the outcome, response paths, operations, arguments, entity references,
+   knowledge topics, and SQL.
+4. For analysis, execute deterministic calculations over the complete applicable
+   population and render identifiers/numbers from typed evidence.
+5. For general knowledge, explain definitions, methodology, and concepts without
+   requiring an analytical query.
+6. For contextual recommendations, combine bounded verified-result context with
+   inventory knowledge. Possible causes are labeled as hypotheses and proposed
+   actions are kept separate from uploaded-data findings.
+7. Mixed questions can execute analysis and add conceptual explanation or actions
+   in the same response. Context updates only from successful tool results.
 
-If `NVIDIA_API_KEY` is absent or the hosted service fails, the inventory
-analysis and Excel report continue to work. Only the assistant is unavailable.
+Reusable operations cover metric ranking, exact SKU comparison, dataset-relative
+demand growth, longest source receipt/PO lookup, and repetition of prior verified
+results. Flexible questions may use one structurally validated DuckDB SELECT/CTE.
+SQL AST checks reject multiple statements, writes, pragmas, attachments,
+extensions, external/unapproved tables and functions, and SQL `LIMIT`. DuckDB
+external access is disabled, memory/row limits apply, and execution has an
+interrupt deadline. Display truncation occurs only after the full query result is
+calculated.
 
-## Assistant capabilities
+Rankings evaluate the complete eligible population before applying the requested
+display count, return cutoff ties, and preserve full precision for ordering.
+Lead-time variability is sample standard deviation and requires at least two
+receipt observations. One observation is reported as insufficient rather than
+as zero variability.
 
-The grounded assistant supports:
+“Last six weeks” is dataset-relative unless real dates are uploaded. Evidence
+shows the reference and period bounds. Growth means the recent-window mean versus
+the immediately preceding equal window. “Increasing” defaults to positive growth
+and is disclosed. “Highly inconsistent” needs a business threshold when used as
+a filter; ranking superlatives do not.
 
-- SKU demand behavior, trends, variability, and intermittency
-- deterministic weekly demand forecasts for a named SKU
-- current versus recommended Safety Stock and ROP
-- Safety Stock and ROP gap rankings
-- an explainable relative **Stockout Risk** ranking
-- receipt lead-time averages and variability
-- unusually long/inconsistent receipt behavior
-- supplier lead-time behavior and consistency
-- supplier and SKU comparisons
-- bounded conversational follow-ups
+The structured context retains current SKU/PO sets, metric, filters, interval,
+original questions, and up to three prior result references. Ambiguous references
+produce clarification. The sequence “most variable SKU” → “longest PO for this
+SKU” → “specific PO please” resolves through verified result IDs and source rows.
+After a verified MAT-1019 variability result, “How can we reduce this variability?”
+uses that SKU and evidence without asking the user to repeat it.
 
-## Relationship-aware assistant data model
+Conceptual prose is separately validated. Recommendation text cannot introduce a
+SKU, PO, or numerical claim absent from verified evidence. If generation is
+unavailable or violates that boundary, the app uses a curated methodology answer
+instead of blocking the conceptual response or weakening numerical grounding.
 
-The assistant has four evidence sources from the latest successful run:
+## Evidence UI
 
-1. `item_master`: one current row per SKU; description, ABC class, current
-   primary supplier, current planning parameters, and cost.
-2. `demand_history`: period-level demand facts used for recent windows,
-   historical averages, variability, intermittency, and forecasts.
-3. `receipt_history`: PO-level actual lead-time facts used for receipt counts,
-   averages, medians, variability, ranges, and long-lead-time outliers.
-4. `analysis_results`: calculated Safety Stock/ROP recommendations, gaps,
-   service assumptions, flags, and analysis conclusions.
+The expandable evidence section shows the result/dataset IDs, source tables,
+metric definition and units, executor-computed coverage/exclusions, filters,
+period interval, source rows, validated plan, executed query when applicable,
+tie policy, calculation completeness, and display truncation.
 
-SKU is the primary relationship key. Supplier-to-SKU membership comes from
-`item_master.supplier`, which represents the SKU's current primary supplier.
-The assistant uses `analysis_results` as enrichment rather than as a substitute
-for the three uploaded sources.
+## Known limitations
 
-Demand and receipt histories are both many-row fact tables. They are never
-joined directly on SKU because doing so would multiply rows (for example, 104
-demand periods by 15 receipts would create 1,560 incorrect rows). Instead,
-`inventory_data.py` independently aggregates each history to one row per SKU,
-validates that grain, and then joins those summaries to the one-row-per-SKU
-item master and analysis results. Supplier rollups traverse this validated SKU
-view or aggregate individual receipt records explicitly.
+- `supplier` is the current primary mapping, not historical PO supplier.
+- Receipt history has no order/receipt timestamp, promised date, receipt quantity,
+  OTIF, fill rate, quality, or PO cost. Those analyses are unsupported.
+- The input has no inventory-position history, backorders, or historical stockout
+  events. Stockout Risk is a relative planning score, not a stockout probability.
+- Historical demand analysis is not presented as a validated forecast. Forecast
+  requests are unsupported by the verified assistant.
+- A repeated PO can identify source receipt rows, but the app does not claim a
+  PO-level aggregate without a business convention.
+- Planner approval is still required before changing ERP parameters.
+- Mock-provider success does not prove that every live-model phrasing succeeds.
 
-Each question creates a source plan before calculations run. Examples:
+## File map
 
-- supplier lookup: `item_master` only
-- recent demand: `demand_history`
-- actual lead time: `receipt_history`
-- Safety Stock explanation: all three uploaded sources plus `analysis_results`
-- supplier/cross-domain rankings: independently aggregated SKU metrics combined
-  at SKU grain
+- `inventory_contracts.py`: canonical schemas, validation, data dictionary, and
+  dataset fingerprinting.
+- `inventory_data.py`: independent fact aggregation and SKU relationship view.
+- `inventory_analytics.py`: typed evidence, deterministic tools, SQL policy,
+  DuckDB registration, limits, and deadlines.
+- `verified_inventory_assistant.py`: provider JSON planning, execution,
+  follow-up context, and deterministic rendering.
+- `inventory_question_parser.py`: compatibility parser/validator for older direct
+  callers; it is not the verified chat path's primary interpreter.
+- `streamlit_app.py`: upload/run flow, session isolation, chat, and evidence UI.
+- `safety_stock_agent.py`: authoritative SS/ROP engine and workbook output.
 
-Natural-language interpretation is separated from calculation. The parser first
-matches SKU, description, and supplier values against the current `item_master`,
-then normalizes business phrasing such as “most inconsistent lead times,” “top
-five by demand volatility,” and “largest Safety Stock gap” into a constrained
-plan containing entity type, metric, direction, limit, filters, and approved
-operations. The word after `SKU` is never assumed to be an identifier; an
-unknown-SKU response requires identifier-shaped evidence and validation against
-the uploaded SKU dictionary. Ambiguous known names produce a clarification.
-
-For phrasing that the deterministic interpreter cannot classify confidently,
-Nemotron may return a small JSON interpretation using an allow-listed schema.
-That response is validated before use and cannot supply column names, executable
-code, or numerical results. Python remains authoritative for every calculation.
-
-Nemotron receives only the resulting question-specific evidence. Answers include
-a compact **Based on** section, and the Streamlit **View data used for this
-answer** expander shows sources, filters, approved Python operations, metric
-definitions, limitations, and the number of result rows sent for explanation.
-
-The derived demand summary, receipt summary, and cross-file SKU view are cached
-in the current Streamlit session as `assistant_data_model`; supplier rollups are
-computed from that validated model.
-They are invalidated together with the raw data and chat when uploads change or
-a new analysis runs. LLM prose is never cached as authoritative data.
-
-Forecasts use up to the latest 13 observations, fit a simple linear trend, and
-damp that trend by 50%. They are transparent planning estimates rather than
-promises of future demand.
-
-Stockout Risk is a relative 0-100 planning score based on Safety Stock gap, ROP
-gap, demand variability, lead-time variability, positive trend, and ABC
-criticality. It is not a probability of stockout.
-
-## Data and analytical limitations
-
-- The inputs do not contain inventory-position history, backorders, or explicit
-  stockout events. The app cannot report historical stockout counts.
-- Supplier analysis is currently lead-time behavior and consistency, not a
-  complete supplier scorecard.
-- Receipt history has no order or receipt date. The assistant therefore does
-  not claim recent supplier slowdown or lead-time trend from PO number or row
-  order.
-- OTIF, fill rate, quality, and promised-date adherence require fields that are
-  not present in the current schemas.
-- Forecasts are estimates based only on uploaded demand history; they do not
-  include promotions, pricing, capacity, or external drivers.
-- Nemotron explains deterministic evidence. It does not replace the Safety
-  Stock/ROP engine or independently calculate portfolio metrics.
-- Planner approval is required before changing ERP planning parameters.
+See `docs/ARCHITECTURE.md` for the architecture note and metric conventions.
 
 ## Tests
 
-The test suite uses no real NVIDIA calls and requires no API key:
+The deterministic and scripted-provider suites require no live API key:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Coverage includes supplier validation/joining, one-row-per-SKU demand and receipt
-aggregation, many-to-many inflation prevention, source selection, raw-history
-authority, missing-history behavior, supplier relationships, deterministic
-forecasts, Safety Stock/ROP rankings, Stockout Risk, unsupported-data responses,
-natural-language ranking/filter/comparison variants, evidence-based entity
-resolution, conversational pronouns, context construction, cache/session reset,
-missing NVIDIA configuration, and mocked Nemotron interpretation/explanation.
+The current suite contains 78 tests covering contracts and grain, partial receipts and exact duplicates,
+many-to-many prevention, sample sizes, direct expected statistics, global
+ranking coverage/ties, PO source retrieval, dataset-relative windows, SQL
+restrictions, untrusted CSV text, malformed plans, provider outages, dataset
+invalidation, session isolation/follow-ups, semantic response-path planning,
+general definitions, contextual recommendations, mixed questions, conceptual
+grounding fallback, and existing SS/ROP regressions.
+
+Optional live-model evaluation requires `NVIDIA_API_KEY` and must report the
+model configuration, repeated-run results, planning errors, and grounding
+failures separately from deterministic tool results.
